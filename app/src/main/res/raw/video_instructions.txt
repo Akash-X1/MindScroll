@@ -1,0 +1,9 @@
+OPTIONAL VIDEO
+
+Put your own MP4 file in this folder and name it exactly:
+motivation.mp4
+
+Final path:
+D:\AndroidProjects\MindScroll\app\src\main\res\raw\motivation.mp4
+
+If the file is missing, MindScroll automatically uses its built-in text motivation card.

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">MindScroll</string>
+    <string name="accessibility_intro">MindScroll uses Accessibility only after you choose to enable Protection. It reads on-screen UI structure such as view identifiers and content descriptions from supported short-video apps to recognize short-video screens and stable video changes for the counter, timer and reminders.</string>
+    <string name="accessibility_description">MindScroll uses Android Accessibility to recognize supported short-video viewers in Instagram, YouTube, TikTok and Facebook, detect stable video changes, measure watch time, and show reminders you configure. Processing stays on-device; captions, comments, messages, passwords, typed text and accessibility-tree contents are not stored or transmitted.</string>
+</resources>
