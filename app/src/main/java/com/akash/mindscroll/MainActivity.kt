@@ -10,6 +10,7 @@ import android.net.Uri
 import android.provider.Settings
 import android.view.HapticFeedbackConstants
 import android.widget.Toast
+import android.widget.VideoView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -67,6 +68,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -88,6 +90,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextAlign
@@ -1182,6 +1185,15 @@ private fun MotivationLibraryScreen(
 ) {
     val media = remember(refreshKey) { library.listMedia() }
     var playbackMode by remember(refreshKey) { mutableStateOf(library.playbackMode) }
+    var previewItem by remember { mutableStateOf<MotivationLibrary.VideoItem?>(null) }
+
+    previewItem?.let { item ->
+        MotivationPreviewDialog(
+            library = library,
+            item = item,
+            onDismiss = { previewItem = null }
+        )
+    }
 
     LazyColumn(
         modifier = modifier.padding(horizontal = 18.dp),
@@ -1233,7 +1245,13 @@ private fun MotivationLibraryScreen(
             }
         }
         items(media, key = { it.id }) { item ->
-            MotivationMediaCard(library = library, item = item, refreshKey = refreshKey, onChanged = onChanged)
+            MotivationMediaCard(
+                library = library,
+                item = item,
+                refreshKey = refreshKey,
+                onChanged = onChanged,
+                onPreview = { previewItem = it }
+            )
         }
         if (media.isEmpty()) {
             item { Text("No motivation media yet.", color = MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -1246,7 +1264,8 @@ private fun MotivationMediaCard(
     library: MotivationLibrary,
     item: MotivationLibrary.VideoItem,
     refreshKey: Int,
-    onChanged: () -> Unit
+    onChanged: () -> Unit,
+    onPreview: (MotivationLibrary.VideoItem) -> Unit
 ) {
     val thumbnail = remember(item.id, refreshKey) { library.loadThumbnail(item, 360) }
     Card(
@@ -1262,7 +1281,8 @@ private fun MotivationMediaCard(
                 modifier = Modifier
                     .size(width = 108.dp, height = 70.dp)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(Color(0xFF1B2638)),
+                    .background(Color(0xFF1B2638))
+                    .clickable { onPreview(item) },
                 contentAlignment = Alignment.Center
             ) {
                 if (thumbnail != null) {
@@ -1303,6 +1323,101 @@ private fun MotivationMediaCard(
                 checked = item.enabled,
                 onCheckedChange = { library.setEnabled(item.id, it); onChanged() }
             )
+        }
+    }
+}
+
+@Composable
+private fun MotivationPreviewDialog(
+    library: MotivationLibrary,
+    item: MotivationLibrary.VideoItem,
+    onDismiss: () -> Unit
+) {
+    val uri = remember(item.id) { library.uriFor(item) }
+    val imagePreview = remember(item.id) {
+        if (item.isImage) library.loadThumbnail(item, 1200) else null
+    }
+    var activeVideoView by remember(item.id) { mutableStateOf<VideoView?>(null) }
+
+    DisposableEffect(item.id) {
+        onDispose {
+            runCatching { activeVideoView?.stopPlayback() }
+            activeVideoView = null
+        }
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            colors = CardDefaults.cardColors(
+                containerColor = Color(0xFF101015),
+                contentColor = MaterialTheme.colorScheme.onSurface
+            ),
+            shape = RoundedCornerShape(26.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    item.title,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Black,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Text(
+                    if (item.isImage) "Image preview" else "Video preview",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontSize = 11.sp
+                )
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(420.dp)
+                        .clip(RoundedCornerShape(18.dp))
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    when {
+                        item.isImage && imagePreview != null -> {
+                            Image(
+                                bitmap = imagePreview.asImageBitmap(),
+                                contentDescription = item.title,
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
+                        !item.isImage && uri != null -> {
+                            AndroidView(
+                                modifier = Modifier.fillMaxSize(),
+                                factory = { ctx ->
+                                    VideoView(ctx).apply {
+                                        activeVideoView = this
+                                        setVideoURI(uri)
+                                        setOnPreparedListener { player ->
+                                            player.isLooping = false
+                                            player.setVolume(1f, 1f)
+                                            start()
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                        else -> {
+                            Text(
+                                "Preview unavailable",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+
+                Button(
+                    modifier = Modifier.fillMaxWidth(),
+                    onClick = onDismiss
+                ) { Text("Close preview") }
+            }
         }
     }
 }
@@ -1353,7 +1468,7 @@ private fun SettingsScreen(
         }
 
         SectionTitle("About")
-        InfoCard("MindScroll", "A mindful short-form video companion from Jack Labs.")
+        InfoCard("MindScroll", "A mindful short-form video companion from Websyno.")
 
         SectionTitle("Privacy & data")
         InfoCard("Local by design", "Tracking, settings, activity and motivation media stay on this device. MindScroll has no INTERNET permission.")
@@ -1366,9 +1481,9 @@ private fun SettingsScreen(
         ) { Text("Delete all my data") }
 
         Spacer(Modifier.height(10.dp))
-        Text("MindScroll V27 • MVP", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+        Text("MindScroll V28 • Beta", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
         Text("Created with purpose by Akash", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurface, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
-        Text("Jack Labs", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text("Websyno", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
     }
 }
 
@@ -2021,40 +2136,57 @@ private fun SupportedAppsCard(
         shape = RoundedCornerShape(22.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 10.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.spacedBy(7.dp)
+            verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            PlatformToggle(
-                modifier = Modifier.weight(1f),
-                iconRes = R.drawable.ic_instagram,
-                label = "Instagram",
-                enabled = instagramEnabled,
-                onChanged = onInstagramChanged
+            Text(
+                "Apps being monitored",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurface
             )
-            PlatformToggle(
-                modifier = Modifier.weight(1f),
-                iconRes = R.drawable.ic_youtube_shorts,
-                label = "Shorts",
-                enabled = youtubeEnabled,
-                onChanged = onYoutubeChanged
+            Text(
+                "Tap a card to turn MindScroll tracking ON or OFF for that app. These buttons do not open the social app.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 10.sp,
+                lineHeight = 14.sp
             )
-            PlatformToggle(
-                modifier = Modifier.weight(1f),
-                iconRes = R.drawable.ic_tiktok,
-                label = "TikTok",
-                enabled = tiktokEnabled,
-                onChanged = onTiktokChanged
-            )
-            PlatformToggle(
-                modifier = Modifier.weight(1f),
-                iconRes = R.drawable.ic_facebook,
-                label = "Facebook",
-                enabled = facebookEnabled,
-                onChanged = onFacebookChanged
-            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                PlatformToggle(
+                    modifier = Modifier.weight(1f),
+                    iconRes = R.drawable.ic_instagram,
+                    label = "Instagram",
+                    enabled = instagramEnabled,
+                    onChanged = onInstagramChanged
+                )
+                PlatformToggle(
+                    modifier = Modifier.weight(1f),
+                    iconRes = R.drawable.ic_youtube_shorts,
+                    label = "Shorts",
+                    enabled = youtubeEnabled,
+                    onChanged = onYoutubeChanged
+                )
+                PlatformToggle(
+                    modifier = Modifier.weight(1f),
+                    iconRes = R.drawable.ic_tiktok,
+                    label = "TikTok",
+                    enabled = tiktokEnabled,
+                    onChanged = onTiktokChanged
+                )
+                PlatformToggle(
+                    modifier = Modifier.weight(1f),
+                    iconRes = R.drawable.ic_facebook,
+                    label = "Facebook",
+                    enabled = facebookEnabled,
+                    onChanged = onFacebookChanged
+                )
+            }
         }
     }
 }
@@ -2076,8 +2208,8 @@ private fun PlatformToggle(
     Column(
         modifier = modifier
             .border(
-                width = if (enabled) 1.dp else 0.dp,
-                color = if (enabled) activeBorder else Color.Transparent,
+                width = 1.dp,
+                color = if (enabled) activeBorder else Color.White.copy(alpha = 0.08f),
                 shape = shape
             )
             .background(container, shape)
@@ -2087,7 +2219,7 @@ private fun PlatformToggle(
             }
             .padding(horizontal = 3.dp, vertical = 9.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(5.dp)
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Box(
             modifier = Modifier
@@ -2100,7 +2232,7 @@ private fun PlatformToggle(
         ) {
             Image(
                 painter = painterResource(iconRes),
-                contentDescription = label,
+                contentDescription = "$label tracking ${if (enabled) "on" else "off"}",
                 modifier = Modifier
                     .size(36.dp)
                     .alpha(if (enabled) 1f else 0.42f),
@@ -2115,6 +2247,13 @@ private fun PlatformToggle(
             fontWeight = if (enabled) FontWeight.SemiBold else FontWeight.Medium,
             maxLines = 1,
             textAlign = TextAlign.Center
+        )
+        Text(
+            if (enabled) "● ON" else "○ OFF",
+            color = if (enabled) MaterialTheme.colorScheme.secondary else inactive,
+            fontSize = 8.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1
         )
     }
 }

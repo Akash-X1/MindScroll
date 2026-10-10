@@ -12,6 +12,9 @@ import android.graphics.Rect
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Handler
@@ -19,6 +22,9 @@ import android.os.Looper
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
+import android.view.KeyEvent
+import android.view.Surface
+import android.view.TextureView
 import android.view.View
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
@@ -29,7 +35,6 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ImageView
 import android.widget.TextView
-import android.widget.VideoView
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -39,7 +44,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * MindScroll V27 — Play-ready MVP.
+ * MindScroll V28 — multi-device closed-test fixes.
  *
  * The user-supplied BrainPal APK was statically inspected as a behavioral
  * reference. Its detector produces DetectionData(isDetected, videoIdentifier,
@@ -208,6 +213,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private var interventionView: View? = null
 
     private var hasTransientAudioFocus = false
+    private var audioFocusRequest: AudioFocusRequest? = null
+    private var interventionMediaPlayer: MediaPlayer? = null
+    private var externalMediaPauseSent = false
     private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { /* transient reminder focus only */ }
 
     private var currentTargetPackage: String? = null
@@ -3999,7 +4007,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         if (!testMode && !store.remindersEnabled) return
         interventionShowing = true
         performConfirmHaptic()
-        muteMediaForIntervention()
+        if (!testMode) muteMediaForIntervention()
         exitCheckToken++
         if (!testMode) pauseWatchClock("intervention shown")
         hideBubble()
@@ -4078,25 +4086,67 @@ class MindScrollAccessibilityService : AccessibilityService() {
                     }
                 )
             } else {
-                val video = VideoView(this).apply {
-                    if (!selectedMotivation.builtIn) {
-                        selectedMotivation.file?.absolutePath?.let { setVideoPath(it) }
-                    } else {
-                        setVideoURI(selectedUri)
-                    }
-                    setOnPreparedListener { player ->
-                        player.isLooping = true
-                        // V19 muted the entire STREAM_MUSIC output, which also muted
-                        // MindScroll's own imported video. V20 uses transient audio focus
-                        // instead, so the underlying Reel/Short yields audio while the
-                        // motivation video's own audio remains audible.
-                        player.setVolume(1f, 1f)
-                        start()
-                    }
-                    setOnErrorListener { _, _, _ ->
-                        visibility = View.GONE
-                        mediaFallback.visibility = View.VISIBLE
-                        true
+                // TextureView + MediaPlayer is more reliable than VideoView/SurfaceView
+                // inside accessibility overlays on Samsung and Honor/MagicOS devices.
+                val video = TextureView(this).apply {
+                    val textureView = this
+                    surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+                        override fun onSurfaceTextureAvailable(
+                            surfaceTexture: android.graphics.SurfaceTexture,
+                            width: Int,
+                            height: Int
+                        ) {
+                            releaseInterventionPlayer()
+                            runCatching {
+                                val surface = Surface(surfaceTexture)
+                                val player = MediaPlayer()
+                                interventionMediaPlayer = player
+                                player.setSurface(surface)
+                                surface.release()
+
+                                if (selectedMotivation.builtIn) {
+                                    player.setDataSource(this@MindScrollAccessibilityService, selectedUri)
+                                } else {
+                                    val path = selectedMotivation.file?.absolutePath
+                                        ?: error("Missing local motivation video")
+                                    player.setDataSource(path)
+                                }
+
+                                player.isLooping = true
+                                player.setOnPreparedListener { prepared ->
+                                    prepared.setVolume(1f, 1f)
+                                    prepared.start()
+                                }
+                                player.setOnErrorListener { _, _, _ ->
+                                    releaseInterventionPlayer()
+                                    textureView.visibility = View.GONE
+                                    mediaFallback.visibility = View.VISIBLE
+                                    true
+                                }
+                                player.prepareAsync()
+                            }.onFailure {
+                                releaseInterventionPlayer()
+                                textureView.visibility = View.GONE
+                                mediaFallback.visibility = View.VISIBLE
+                            }
+                        }
+
+                        override fun onSurfaceTextureSizeChanged(
+                            surfaceTexture: android.graphics.SurfaceTexture,
+                            width: Int,
+                            height: Int
+                        ) = Unit
+
+                        override fun onSurfaceTextureDestroyed(
+                            surfaceTexture: android.graphics.SurfaceTexture
+                        ): Boolean {
+                            releaseInterventionPlayer()
+                            return true
+                        }
+
+                        override fun onSurfaceTextureUpdated(
+                            surfaceTexture: android.graphics.SurfaceTexture
+                        ) = Unit
                     }
                 }
                 card.addView(
@@ -4165,7 +4215,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         val yesButton = actionButton("Yes — continue", 0xFF252531.toInt(), Color.WHITE).apply {
             visibility = View.GONE
             setOnClickListener {
-                dismissIntervention()
+                dismissIntervention(resumeExternalMedia = true)
                 if (testMode) return@setOnClickListener
                 val now = System.currentTimeMillis()
                 // Keep the current session number/time. From this point onward the
@@ -4188,7 +4238,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             setOnClickListener {
                 performConfirmHaptic()
-                dismissIntervention()
+                dismissIntervention(resumeExternalMedia = true)
                 if (!testMode) {
                     val now = System.currentTimeMillis()
                     currentReminderPhase = SettingsStore.REMINDER_PHASE_REPEAT
@@ -4246,24 +4296,22 @@ class MindScrollAccessibilityService : AccessibilityService() {
         handler.postDelayed(countdownRunnable, 1000L)
     }
 
-    private fun dismissIntervention() {
+    private fun dismissIntervention(resumeExternalMedia: Boolean = false) {
+        releaseInterventionPlayer()
         interventionView?.let { view ->
-            (view as? FrameLayout)?.let { root -> findVideoView(root)?.stopPlayback() }
             runCatching { windowManager.removeView(view) }
         }
         interventionView = null
         interventionShowing = false
-        restoreMediaAfterIntervention()
+        restoreMediaAfterIntervention(resumeExternalMedia)
     }
 
-    private fun findVideoView(view: View): VideoView? {
-        if (view is VideoView) return view
-        if (view is android.view.ViewGroup) {
-            for (i in 0 until view.childCount) {
-                findVideoView(view.getChildAt(i))?.let { return it }
-            }
-        }
-        return null
+    private fun releaseInterventionPlayer() {
+        val player = interventionMediaPlayer ?: return
+        interventionMediaPlayer = null
+        runCatching { player.stop() }
+        runCatching { player.reset() }
+        runCatching { player.release() }
     }
 
     private fun actionButton(text: String, backgroundColor: Int, textColor: Int): Button {
@@ -4349,21 +4397,39 @@ class MindScrollAccessibilityService : AccessibilityService() {
             elevation = dp(10).toFloat()
             background = roundedDrawable(0xF21A1A22.toInt(), 18f, 0x665E50FF, 1)
             setOnClickListener {
-                store.remindersEnabled = !store.remindersEnabled
-                if (store.remindersEnabled) {
-                    val now = System.currentTimeMillis()
-                    val minutes = if (currentReminderPhase == SettingsStore.REMINDER_PHASE_REPEAT) store.repeatPauseMinutes else store.firstPauseMinutes
-                    sessionStartedAt = now
-                    nextInterventionAt = now + minutes * 60_000L
-                } else {
-                    nextInterventionAt = 0L
-                }
+                val enabled = !store.protectionEnabled
+                store.protectionEnabled = enabled
                 performConfirmHaptic()
-                updateBubbleQuickMenuText(this)
-                updateBubble()
-                persistSession(force = true)
-                scheduleBubbleMenuAutoHide()
-                diag("REMINDERS quick-toggle enabled=${store.remindersEnabled}")
+
+                if (enabled) {
+                    val now = System.currentTimeMillis()
+                    if (store.remindersEnabled &&
+                        currentTargetPackage != null &&
+                        isShortVideoMode(currentMode)
+                    ) {
+                        val minutes =
+                            if (currentReminderPhase == SettingsStore.REMINDER_PHASE_REPEAT) {
+                                store.repeatPauseMinutes
+                            } else {
+                                store.firstPauseMinutes
+                            }
+                        sessionStartedAt = now
+                        nextInterventionAt = now + minutes * 60_000L
+                        resumeWatchClock("Protection quick-toggle on")
+                    }
+                    updateBubbleQuickMenuText(this)
+                    updateBubble()
+                    persistSession(force = true)
+                    scheduleBubbleMenuAutoHide()
+                } else {
+                    pauseWatchClock("Protection quick-toggle off")
+                    nextInterventionAt = 0L
+                    updateBubbleQuickMenuText(this)
+                    persistSession(force = true)
+                    handler.postDelayed({ hideBubble() }, 180L)
+                }
+
+                diag("PROTECTION quick-toggle enabled=$enabled")
             }
         }
         updateBubbleQuickMenuText(label)
@@ -4382,9 +4448,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
     }
 
     private fun updateBubbleQuickMenuText(view: TextView) {
-        val on = store.remindersEnabled
-        view.text = if (on) "Reminders  ON" else "Reminders  OFF"
-        view.setTextColor(if (on) 0xFF70E1C1.toInt() else 0xFFC6C0D8.toInt())
+        val on = store.protectionEnabled
+        view.text = if (on) "Protection  ON" else "Protection  OFF"
+        view.setTextColor(if (on) 0xFF70E1C1.toInt() else 0xFFFF7B83.toInt())
     }
 
     private fun positionBubbleQuickMenu(menu: View) {
@@ -4437,32 +4503,87 @@ class MindScrollAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Request transient media focus instead of setting STREAM_MUSIC to zero.
-     * Zeroing the stream muted the user's imported motivation video as well.
-     * Audio focus asks the underlying social app to pause/yield while keeping
-     * MindScroll's own video audio audible.
+     * Pause the social-media session before the reminder starts. Some devices
+     * (notably Honor/MagicOS and some Samsung builds) do not pause Instagram from
+     * a normal transient audio-focus request alone, so V28 also sends MEDIA_PAUSE
+     * and requests exclusive transient focus.
      */
     private fun muteMediaForIntervention() {
-        if (!store.muteDuringIntervention || hasTransientAudioFocus) return
+        if (!store.muteDuringIntervention) return
+
         runCatching {
             val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            val result = audio.requestAudioFocus(
-                audioFocusListener,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+
+            audio.dispatchMediaKeyEvent(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PAUSE)
             )
-            hasTransientAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        }.onFailure { hasTransientAudioFocus = false }
+            audio.dispatchMediaKeyEvent(
+                KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PAUSE)
+            )
+            externalMediaPauseSent = true
+
+            if (!hasTransientAudioFocus) {
+                val request = AudioFocusRequest.Builder(
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+                )
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                            .build()
+                    )
+                    .setAcceptsDelayedFocusGain(false)
+                    .setWillPauseWhenDucked(true)
+                    .setOnAudioFocusChangeListener(audioFocusListener, handler)
+                    .build()
+
+                audioFocusRequest = request
+                hasTransientAudioFocus =
+                    audio.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+        }.onFailure {
+            hasTransientAudioFocus = false
+            audioFocusRequest = null
+        }
     }
 
-    private fun restoreMediaAfterIntervention() {
-        if (!hasTransientAudioFocus) return
-        hasTransientAudioFocus = false
-        runCatching {
-            val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            @Suppress("DEPRECATION")
-            audio.abandonAudioFocus(audioFocusListener)
+    private fun restoreMediaAfterIntervention(resumeExternalMedia: Boolean = false) {
+        val audio = runCatching {
+            getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        }.getOrNull()
+
+        if (hasTransientAudioFocus && audio != null) {
+            val request = audioFocusRequest
+            if (request != null) {
+                runCatching { audio.abandonAudioFocusRequest(request) }
+            } else {
+                @Suppress("DEPRECATION")
+                runCatching { audio.abandonAudioFocus(audioFocusListener) }
+            }
         }
+
+        hasTransientAudioFocus = false
+        audioFocusRequest = null
+
+        if (resumeExternalMedia &&
+            externalMediaPauseSent &&
+            audio != null &&
+            currentTargetPackage != null &&
+            isShortVideoMode(currentMode)
+        ) {
+            handler.postDelayed({
+                runCatching {
+                    audio.dispatchMediaKeyEvent(
+                        KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY)
+                    )
+                    audio.dispatchMediaKeyEvent(
+                        KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY)
+                    )
+                }
+            }, 160L)
+        }
+
+        externalMediaPauseSent = false
     }
 
     private fun decodeSampledBitmap(path: String, targetWidth: Int, targetHeight: Int): android.graphics.Bitmap? {
