@@ -30,7 +30,7 @@ jobs:
       - name: Accept SDK licenses and install API 37
         run: |
           yes | sdkmanager --licenses || true
-          sdkmanager --channel=3 "platforms;android-37"
+          sdkmanager "platforms;android-36"
 
       - name: Compile Android app
         run: |
