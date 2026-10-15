@@ -1,0 +1,59 @@
+name: Package MindScroll V31 patch ZIP
+on:
+  push:
+    branches:
+      - v31-system-ui-overlay-patch-package
+    paths-ignore:
+      - "MindScroll_V31_SystemUi_Fix.zip"
+permissions:
+  contents: write
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create replacement-file ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf package
+          mkdir -p package/app/src/main/java/com/akash/mindscroll
+          cp v31-patch/app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt package/app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt
+          cat > package/README.txt <<'EOF'
+          MindScroll V31 — Android System UI overlay fix
+          
+          HOW TO APPLY
+          1. Close Android Studio or leave the project open.
+          2. Extract this ZIP directly into:
+             D:\AndroidProjects\MindScroll
+          3. Allow Windows to replace:
+             app\src\main\java\com\akash\mindscroll\MindScrollAccessibilityService.kt
+          4. In app/build.gradle.kts, set:
+             versionCode = 6
+             versionName = "1.4"
+             (This assumes your current V30 release used versionCode 5 / versionName 1.3.)
+          5. In Android Studio, click Build > Make Project and fix any build errors before installing.
+          6. Test the motivational intervention, pull down Quick Settings from the top-right, then notifications from the top-left. Confirm the panel is visible/usable and the splash returns when the panel closes.
+          7. If the tests pass, generate a newly signed Android App Bundle (AAB). The old V30 AAB does not contain this fix.
+          
+          This ZIP contains only the replacement Kotlin file and this README. It does not include signing keys, a built APK/AAB, or a full Android Studio project. Source change is not claimed to be compiled or device-tested.
+          EOF
+          (cd package && zip -r ../MindScroll_V31_SystemUi_Fix.zip app README.txt)
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MindScroll_V31_SystemUi_Fix
+          path: MindScroll_V31_SystemUi_Fix.zip
+          if-no-files-found: error
+          retention-days: 30
+      - name: Store ZIP on this isolated branch for direct download
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add MindScroll_V31_SystemUi_Fix.zip
+          if ! git diff --cached --quiet; then
+            git commit -m "Package MindScroll V31 system UI fix ZIP"
+            git push
+          fi
