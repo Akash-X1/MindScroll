@@ -340,6 +340,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
                         pauseWatchClock(reason)
                         if (currentTargetPackage != null) {
                             suspendTargetSession(reason)
+                        } else {
+                            currentMode = ScreenMode.OTHER
+                            hideBubble()
                         }
                         persistSessionIfNeeded()
                         handler.postDelayed(this, 300L)
