@@ -92,6 +92,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         // Session/foreground stability.
         private const val FOREIGN_APP_EXIT_CONFIRM_MS = 650L
         private const val FOREIGN_APP_SECOND_CHECK_MS = 450L
+        private const val SYSTEM_PANEL_TRANSITION_GRACE_MS = 1_500L
         private const val SESSION_RESUME_GRACE_MS = 10 * 60_000L
         private const val SESSION_PERSIST_INTERVAL_MS = 5_000L
         private const val WATCH_FLUSH_INTERVAL_MS = 5_000L
@@ -221,6 +222,8 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private var hasTransientAudioFocus = false
     private var audioFocusRequest: AudioFocusRequest? = null
     private var interventionMediaPlayer: MediaPlayer? = null
+    // Timestamp of the last SystemUI window transition while an intervention is visible.
+    private var lastSystemUiWindowTransitionAt: Long = 0L
     private var externalMediaPauseSent = false
     private var externalMediaPausedViaTap = false
 
@@ -323,6 +326,15 @@ class MindScrollAccessibilityService : AccessibilityService() {
             // Keep the intervention stable while it is displayed. System UI shade
             // windows do not count as leaving the foreground app; Home/another app does.
             if (interventionShowing) {
+                // The shade/Quick Settings is a temporary system surface. It must cover
+                // this same overlay, not trigger removal of the root or release of MediaPlayer.
+                if (isSystemPanelCoveringIntervention()) {
+                    pauseWatchClock("system notification/Quick Settings panel over intervention")
+                    hideBubble()
+                    persistSessionIfNeeded()
+                    handler.postDelayed(this, 300L)
+                    return
+                }
                 val expectedForeground = if (interventionTestMode) {
                     packageName
                 } else {
@@ -620,12 +632,28 @@ class MindScrollAccessibilityService : AccessibilityService() {
             handleDeviceUnavailable("accessibility event while screen off/locked")
             return
         }
+        val eventPackage = event.packageName?.toString().orEmpty()
+        if (
+            interventionShowing &&
+            eventPackage.contains("systemui", ignoreCase = true) &&
+            (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
+             event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED)
+        ) {
+            // Give the system shade window time to become visible in getWindows().
+            // The timer uses this short transition grace plus actual shade-window
+            // detection so the overlay is not removed during panel animations.
+            lastSystemUiWindowTransitionAt = System.currentTimeMillis()
+        }
         if (interventionShowing) {
             // A notification/Quick Settings event belongs to Android System UI
-            // and is allowed to layer above the splash. An event from a different
-            // real app (for example, the launcher after Home) ends the intervention.
+            // and is allowed to layer above the splash. Events from the launcher
+            // during the shade animation must not dismiss the underlying overlay.
             // Ignore MindScroll's own overlay package so it cannot dismiss itself.
-            val eventPackage = event.packageName?.toString().orEmpty()
+            if (isSystemPanelCoveringIntervention()) {
+                pauseWatchClock("system notification/Quick Settings panel over intervention")
+                hideBubble()
+                return
+            }
             val targetPackage = currentTargetPackage
             if (
                 !interventionTestMode &&
@@ -896,6 +924,43 @@ class MindScrollAccessibilityService : AccessibilityService() {
         return runCatching {
             rootInActiveWindow?.packageName?.toString()
         }.getOrNull()
+    }
+
+    private fun isSystemNotificationPanelExpanded(): Boolean {
+        // SystemUI also owns the tiny status/navigation bar windows. Only treat a
+        // SystemUI window as the open shade when it is panel-sized or reports a
+        // notification/Quick Settings root class.
+        val metrics = resources.displayMetrics
+        val screenHeight = metrics.heightPixels.coerceAtLeast(1).toFloat()
+        val screenWidth = metrics.widthPixels.coerceAtLeast(1).toFloat()
+        return runCatching {
+            windows.any { window ->
+                val root = window.root ?: return@any false
+                val rootPackage = root.packageName?.toString().orEmpty()
+                if (!rootPackage.contains("systemui", ignoreCase = true)) {
+                    return@any false
+                }
+                val rootClass = root.className?.toString().orEmpty()
+                val bounds = Rect()
+                window.getBoundsInScreen(bounds)
+                val panelSizedWindow =
+                    bounds.height().toFloat() >= screenHeight * 0.25f &&
+                    bounds.width().toFloat() >= screenWidth * 0.70f
+                val panelRootClass =
+                    rootClass.contains("NotificationShade", ignoreCase = true) ||
+                    rootClass.contains("QuickSettings", ignoreCase = true) ||
+                    rootClass.contains("QSPanel", ignoreCase = true)
+                panelSizedWindow || panelRootClass
+            }
+        }.getOrDefault(false)
+    }
+
+    private fun isSystemPanelCoveringIntervention(): Boolean {
+        if (isSystemNotificationPanelExpanded()) return true
+        val age = System.currentTimeMillis() - lastSystemUiWindowTransitionAt
+        return lastSystemUiWindowTransitionAt > 0L &&
+            age >= 0L &&
+            age <= SYSTEM_PANEL_TRANSITION_GRACE_MS
     }
 
     private fun isTransientSystemPackage(packageName: String): Boolean {
