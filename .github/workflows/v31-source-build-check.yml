@@ -37,3 +37,47 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Package four-file Windows patch ZIP
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/MindScroll_V31_Notification_Shade_Fix"
+          mkdir -p "$stage/app/src/main/java/com/akash/mindscroll"
+          cp app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt "$stage/app/src/main/java/com/akash/mindscroll/"
+          cp app/src/main/java/com/akash/mindscroll/MainActivity.kt "$stage/app/src/main/java/com/akash/mindscroll/"
+          cp app/src/main/AndroidManifest.xml "$stage/app/src/main/"
+          cp app/build.gradle.kts "$stage/app/"
+          # Preserve the project's intended API 37 config in the user-facing patch.
+          sed -i 's/release(36)/release(37)/; s/targetSdk = 36/targetSdk = 37/' "$stage/app/build.gradle.kts"
+          cat > "$stage/README.txt" <<'EOF'
+          MindScroll V31 — Notification / Quick Settings Shade Fix
+
+          This ZIP contains a four-file patch. It does not include a built APK.
+
+          Install the patch:
+          1. Back up your D:\AndroidProjects\MindScroll project.
+          2. Extract this ZIP into D:\AndroidProjects\MindScroll\ and allow Windows to replace the four matching files.
+          3. Open Android Studio and wait for Gradle sync, then choose Build > Make Project.
+          4. In MindScroll Settings, open System panel support and tap Allow system panel overlay. In Android Settings, enable Display over other apps for MindScroll if prompted.
+          5. Install the debug build and test before publishing.
+
+          Expected behavior:
+          - Open the motivational interruption over Reels.
+          - Pull down Notifications or Quick Settings: Android's panel should cover the same interruption screen.
+          - Close the panel: the same interruption and video should still be there without tapping Play.
+          - Press Home or open a different app: the interruption should be dismissed rather than stay over that app.
+
+          Notes:
+          - The source compile is checked in CI with Android API 36 because API 37 is unavailable on that runner. The patch preserves the project's API 37 Gradle settings.
+          - This package has not been verified on a physical Samsung S25 Ultra. Test on-device before uploading it to Google Play.
+          EOF
+          cd "$stage"
+          zip -qr "$RUNNER_TEMP/MindScroll_V31_Notification_Shade_Fix.zip" app README.txt
+
+      - name: Upload patch ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: MindScroll_V31_Notification_Shade_Fix
+          path: ${{ runner.temp }}/MindScroll_V31_Notification_Shade_Fix.zip
+          if-no-files-found: error
+          retention-days: 14
