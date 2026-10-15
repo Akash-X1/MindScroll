@@ -18,54 +18,36 @@ jobs:
           set -euo pipefail
           rm -rf package
           mkdir -p package/app/src/main/java/com/akash/mindscroll
+          mkdir -p package/app/src/main
           cp v31-patch/app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt package/app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt
           cp v31-patch/app/src/main/java/com/akash/mindscroll/MainActivity.kt package/app/src/main/java/com/akash/mindscroll/MainActivity.kt
+          cp v31-patch/app/src/main/AndroidManifest.xml package/app/src/main/AndroidManifest.xml
+          cp v31-patch/app/build.gradle.kts package/app/build.gradle.kts
           cat > package/README.txt <<'EOF'
           MindScroll V31 — System UI layering and intervention lifecycle fix
 
           WHAT THIS PATCH CHANGES
-          - Removes the previous hide/show behavior that caused splash flicker.
-          - Uses an application overlay so Android's system shade can appear above the splash after overlay permission is enabled.
-          - Dismisses the real motivational intervention if the user leaves the target app, including Home.
+          - Removes the hide/show loop that caused motivational splash flickering.
+          - Uses Android's application overlay layer so notifications and Quick Settings can appear above the motivational splash after permission is enabled.
+          - Dismisses the real intervention if the user leaves the target app, including Home.
           - Shows "MindScroll V31 • Beta" on the Settings screen.
           - Keeps the watch timer paused while the intervention is visible.
+          - Sets versionCode 6 and versionName 1.4.
+          - Declares the special display-over-other-apps permission.
 
           HOW TO APPLY
           1. Extract this ZIP directly into D:\AndroidProjects\MindScroll.
-          2. Allow Windows to replace both Kotlin files:
+          2. Allow Windows to replace the four files:
              app\src\main\java\com\akash\mindscroll\MindScrollAccessibilityService.kt
              app\src\main\java\com\akash\mindscroll\MainActivity.kt
-          3. Open app\src\main\AndroidManifest.xml. Immediately after the opening <manifest ...> line, add:
-             <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
-             Do not remove other permissions or entries.
-          4. Open app\build.gradle.kts and set:
-             versionCode = 6
-             versionName = "1.4"
-             (V30 was versionCode 5 / versionName 1.3; if your current console release differs, use the next unused code.)
-          5. Android Studio: Build > Make Project. Fix any build errors before installing.
-          6. Install/open the app. Go to Settings > System panel support > Allow system panel overlay, then enable "Allow display over other apps" for MindScroll in Android Settings.
-          7. Test: trigger the intervention, pull Quick Settings from the top-right and notifications from the top-left. The splash should remain steady underneath the system panel. Close the panel; the splash should remain.
-          8. While the intervention is active, go to Home or another app. The intervention should dismiss and not linger over Home.
-          9. After tests pass, generate a new signed AAB. Do not upload the old V30 AAB.
+             app\src\main\AndroidManifest.xml
+             app\build.gradle.kts
+          3. Open Android Studio. Click Build > Make Project. Fix any errors before installing.
+          4. Run/install the app. Open MindScroll > Settings > System panel support > Allow system panel overlay.
+          5. In Android Settings, turn on "Allow display over other apps" for MindScroll, then return to MindScroll.
+          6. Test: trigger the intervention, pull Quick Settings down from the top-right and notifications down from the top-left. The splash should stay steady underneath the system panel. Close the panel; the splash should remain.
+          7. While the intervention is active, go to Home or another app. The real intervention should dismiss and not stay over Home.
+          8. Confirm Settings shows "MindScroll V31 • Beta".
+          9. After tests pass, generate a newly signed Android App Bundle (AAB) and upload it to your existing closed testing track. Do not upload the old V30 AAB.
 
           This ZIP contains source files only. It does not include a signed APK/AAB or signing keys. The code has not been compiled or device-tested here.
-          EOF
-          (cd package && zip -r ../MindScroll_V31_SystemUi_Fix.zip app README.txt)
-      - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: MindScroll_V31_SystemUi_Fix
-          path: MindScroll_V31_SystemUi_Fix.zip
-          if-no-files-found: error
-          retention-days: 30
-      - name: Store ZIP on this isolated branch for direct download
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add MindScroll_V31_SystemUi_Fix.zip
-          if ! git diff --cached --quiet; then
-            git commit -m "Package MindScroll V31 system UI fix ZIP"
-            git push
-          fi
