@@ -626,11 +626,12 @@ class MindScrollAccessibilityService : AccessibilityService() {
             // real app (for example, the launcher after Home) ends the intervention.
             // Ignore MindScroll's own overlay package so it cannot dismiss itself.
             val eventPackage = event.packageName?.toString().orEmpty()
-            val expectedPackage = if (interventionTestMode) packageName else currentTargetPackage
+            val targetPackage = currentTargetPackage
             if (
-                !expectedPackage.isNullOrBlank() &&
+                !interventionTestMode &&
+                !targetPackage.isNullOrBlank() &&
                 eventPackage.isNotBlank() &&
-                eventPackage != expectedPackage &&
+                eventPackage != targetPackage &&
                 eventPackage != packageName &&
                 !isTransientSystemPackage(eventPackage)
             ) {
