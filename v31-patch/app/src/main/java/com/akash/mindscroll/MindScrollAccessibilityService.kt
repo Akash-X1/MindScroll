@@ -4604,6 +4604,8 @@ class MindScrollAccessibilityService : AccessibilityService() {
             }
         )
 
+        // V31: application overlays sit below Android's privileged System UI,
+        // allowing the notification shade/Quick Settings to remain visible above it.
         val interventionWindowType =
             if (Settings.canDrawOverlays(this)) {
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
