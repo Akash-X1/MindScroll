@@ -1445,6 +1445,9 @@ private fun SettingsScreen(
     onResetStats: () -> Unit,
     onDeleteAll: () -> Unit
 ) {
+    val settingsContext = LocalContext.current
+    val overlayPermissionGranted = Settings.canDrawOverlays(settingsContext)
+
     Column(
         modifier = modifier
             .verticalScroll(rememberScrollState())
@@ -1467,6 +1470,26 @@ private fun SettingsScreen(
             PermissionRequiredCard(onOpenAccessibility)
         }
 
+        SectionTitle("System panel support")
+        InfoCard(
+            "Keep the splash behind system panels",
+            "Allow this permission so Android notifications and Quick Settings can appear above the motivational screen."
+        )
+        OutlinedButton(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = {
+                if (!overlayPermissionGranted) {
+                    val overlayIntent = Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${settingsContext.packageName}")
+                    )
+                    settingsContext.startActivity(overlayIntent)
+                }
+            }
+        ) {
+            Text(if (overlayPermissionGranted) "System panel overlay enabled" else "Allow system panel overlay")
+        }
+
         SectionTitle("About")
         InfoCard("MindScroll", "A mindful short-form video companion from Websyno.")
 
@@ -1481,7 +1504,7 @@ private fun SettingsScreen(
         ) { Text("Delete all my data") }
 
         Spacer(Modifier.height(10.dp))
-        Text("MindScroll V28 • Beta", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+        Text("MindScroll V31 • Beta", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
         Text("Created with purpose by Akash", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.onSurface, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
         Text("Websyno", modifier = Modifier.fillMaxWidth(), color = MaterialTheme.colorScheme.primary, fontSize = 11.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
     }
