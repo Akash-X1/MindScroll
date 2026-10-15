@@ -1,19 +1,19 @@
-name: V31 Source Build Check
+name: V33 Warning Cleanup Build Check
 
 on:
   push:
     branches:
-      - v31-build-validation
+      - v33-warning-cleanup
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out V31 validation branch
+      - name: Check out V33 candidate
         uses: actions/checkout@v4
 
       - name: Set up Java
@@ -27,7 +27,7 @@ jobs:
         with:
           packages: platform-tools
 
-      - name: Accept SDK licenses and install API 37
+      - name: Accept SDK licenses and install API 36 for CI validation
         run: |
           yes | sdkmanager --licenses || true
           sdkmanager "platforms;android-36"
@@ -36,3 +36,73 @@ jobs:
         run: |
           chmod +x gradlew
           ./gradlew --no-daemon --stacktrace assembleDebug
+
+      - name: Package V33 Windows patch ZIP
+        run: |
+          set -euo pipefail
+          stage="$RUNNER_TEMP/MindScroll_V33_Warning_Cleanup"
+          mkdir -p "$stage/app/src/main/java/com/akash/mindscroll" "$stage/app/src/main/res/values"
+          cp app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt "$stage/app/src/main/java/com/akash/mindscroll/"
+          cp app/src/main/java/com/akash/mindscroll/MainActivity.kt "$stage/app/src/main/java/com/akash/mindscroll/"
+          cp app/src/main/AndroidManifest.xml "$stage/app/src/main/"
+          cp app/src/main/res/values/strings.xml "$stage/app/src/main/res/values/"
+          cp app/build.gradle.kts "$stage/app/"
+          # Preserve the user's API 37 build configuration in the patch.
+          sed -i 's/release(36)/release(37)/; s/targetSdk = 36/targetSdk = 37/' "$stage/app/build.gradle.kts"
+          cat > "$stage/README.txt" <<'EOF'
+          MindScroll V33 — Warning Cleanup + Notification Shade Fix
+          ==========================================================
+
+          This ZIP is a source patch, not a signed APK/AAB.
+
+          Base:
+          - Uses the V32 shade-preservation behavior: the interruption screen/video remains
+            attached while the target app still has an application window; dismiss only
+            after two checks find no target application window.
+          - Settings version is MindScroll V33 • Beta.
+          - Gradle versionCode = 7, versionName = 1.5.
+
+          Installation:
+          1. Back up D:\AndroidProjects\MindScroll.
+          2. Extract the ZIP into D:\AndroidProjects\MindScroll and allow replacement of the
+             matching files. The ZIP contains two Kotlin files, AndroidManifest.xml,
+             app/build.gradle.kts, and app/src/main/res/values/strings.xml.
+          3. Open Android Studio and select Build > Make Project.
+          4. In MindScroll Settings, enable System panel overlay and grant Display over other
+             apps when Android asks.
+          5. Install the debug build and test Notifications, fully expanded Quick Settings,
+             closing each panel, then pressing Home/opening another app.
+
+          Warnings:
+          - The build was compile-checked in CI against Android API 36 because that is the
+            installed platform on the CI runner; this ZIP preserves the project's API 37
+            compile/target settings.
+          - Some remaining Android Studio items may be style/inspection messages (redundant
+            qualifiers, spelling, boolean-literal arguments). The AccessibilityService policy
+            reminder is not a compiler warning: review the prominent disclosure, explicit
+            consent, and Play Console accessibility declaration before release.
+          - This has not been tested on a physical Samsung S25 Ultra. Do not upload to Google
+            Play until device behavior is confirmed.
+          EOF
+          cd "$stage"
+          zip -qr "$RUNNER_TEMP/MindScroll_V33_Warning_Cleanup.zip" app README.txt
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MindScroll_V33_Warning_Cleanup
+          path: ${{ runner.temp }}/MindScroll_V33_Warning_Cleanup.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish direct-download ZIP on an isolated branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan v33-release-download
+          git rm -rf . >/dev/null 2>&1 || true
+          cp "$RUNNER_TEMP/MindScroll_V33_Warning_Cleanup.zip" .
+          git add MindScroll_V33_Warning_Cleanup.zip
+          git commit -m "Publish MindScroll V33 warning-cleanup patch ZIP"
+          git push origin HEAD:refs/heads/v33-release-download --force
