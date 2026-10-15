@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -81,3 +81,17 @@ jobs:
           path: ${{ runner.temp }}/MindScroll_V31_Notification_Shade_Fix.zip
           if-no-files-found: error
           retention-days: 14
+
+      - name: Publish direct-download ZIP on isolated branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan v31-notification-shade-package
+          git rm -rf . >/dev/null 2>&1 || true
+          cp "$RUNNER_TEMP/MindScroll_V31_Notification_Shade_Fix.zip" .
+          git add MindScroll_V31_Notification_Shade_Fix.zip
+          git commit -m "Publish V31 notification shade preservation ZIP"
+          git push origin HEAD:refs/heads/v31-notification-shade-package --force
