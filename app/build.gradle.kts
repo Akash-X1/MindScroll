@@ -6,13 +6,13 @@ plugins {
 android {
     namespace = "com.akash.mindscroll"
     compileSdk {
-        version = release(37)
+        version = release(36)
     }
 
     defaultConfig {
         applicationId = "com.akash.mindscroll"
         minSdk = 26
-        targetSdk = 37
+        targetSdk = 36
         versionCode = 6
         versionName = "1.4"
 
