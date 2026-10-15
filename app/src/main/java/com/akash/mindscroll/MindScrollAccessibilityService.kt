@@ -18,7 +18,8 @@ import android.media.AudioManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.MediaPlayer
-import android.net.Uri
+import androidx.core.content.ContextCompat
+import androidx.core.view.accessibility.AccessibilityNodeInfoCompat
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
@@ -49,7 +50,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * MindScroll V31 — system shade layering and intervention lifecycle fixes.
+ * MindScroll V33 — shade preservation and warning cleanup.
  *
  * The user-supplied BrainPal APK was statically inspected as a behavioral
  * reference. Its detector produces DetectionData(isDetected, videoIdentifier,
@@ -217,6 +218,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private var bubbleMenuView: View? = null
     private var interventionView: View? = null
     private var interventionTestMode = false
+    private var interventionAbandonStreak = 0
 
     private var hasTransientAudioFocus = false
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -320,22 +322,23 @@ class MindScrollAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // Keep the intervention stable while it is displayed. System UI shade
-            // windows do not count as leaving the foreground app; Home/another app does.
+            // Keep the same interruption screen/video alive while the target app
+            // still has an application window. The notification shade and Quick Panel
+            // can draw above it; Home or a genuine app switch removes the target window.
             if (interventionShowing) {
-                val expectedForeground = if (interventionTestMode) {
-                    packageName
-                } else {
-                    currentTargetPackage
-                }
+                val expectedForeground = if (interventionTestMode) packageName else currentTargetPackage
                 if (expectedForeground != null) {
-                    val foreground = resolveForegroundPackage()
-                    if (!foreground.isNullOrBlank() &&
-                        foreground != expectedForeground &&
-                        foreground != packageName &&
-                        !isTransientSystemPackage(foreground)
-                    ) {
-                        val reason = "intervention abandoned; foreground=$foreground"
+                    val present = targetHasApplicationWindow(expectedForeground)
+                    if (present == false) {
+                        interventionAbandonStreak++
+                    } else {
+                        // An inconclusive accessibility window list must not dismiss the splash.
+                        interventionAbandonStreak = 0
+                    }
+                    if (interventionAbandonStreak >= 2) {
+                        interventionAbandonStreak = 0
+                        val reason = "intervention abandoned; $expectedForeground has no app window"
+                        diag("INTERVENTION dismiss: $reason")
                         dismissIntervention(resumeExternalMedia = false)
                         pauseWatchClock(reason)
                         if (currentTargetPackage != null) {
@@ -486,24 +489,24 @@ class MindScrollAccessibilityService : AccessibilityService() {
             addAction(ACTION_REMINDER_TIMING_CHANGED)
             addAction(ACTION_DELETE_ALL_DATA)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(controlReceiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(controlReceiver, filter)
-        }
+        ContextCompat.registerReceiver(
+            this,
+            controlReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
 
         val deviceFilter = IntentFilter().apply {
             addAction(Intent.ACTION_SCREEN_OFF)
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(deviceStateReceiver, deviceFilter, RECEIVER_NOT_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(deviceStateReceiver, deviceFilter)
-        }
+        ContextCompat.registerReceiver(
+            this,
+            deviceStateReceiver,
+            deviceFilter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         deviceStateReceiverRegistered = true
 
         // Seed current state in case Accessibility was enabled while the phone was locked.
@@ -513,7 +516,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
             handleDeviceUnavailable("service connected while screen off/locked")
         }
 
-        diag("SERVICE connected V31")
+        diag("SERVICE connected V33")
         handler.post(timerRunnable)
     }
 
@@ -534,7 +537,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
             // devices that deliver SCREEN_ON before their power state settles.
             deviceScreenOffObserved = false
         }
-        return powerInteractive && !keyguardLocked && !deviceScreenOffObserved
+        return powerInteractive && !keyguardLocked
     }
 
     private fun handleDeviceScreenOff() {
@@ -621,35 +624,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
             return
         }
         if (interventionShowing) {
-            // A notification/Quick Settings event belongs to Android System UI
-            // and is allowed to layer above the splash. An event from a different
-            // real app (for example, the launcher after Home) ends the intervention.
-            // Ignore MindScroll's own overlay package so it cannot dismiss itself.
-            val eventPackage = event.packageName?.toString().orEmpty()
-            val targetPackage = currentTargetPackage
-            if (
-                !interventionTestMode &&
-                !targetPackage.isNullOrBlank() &&
-                eventPackage.isNotBlank() &&
-                eventPackage != targetPackage &&
-                eventPackage != packageName &&
-                !isTransientSystemPackage(eventPackage)
-            ) {
-                val reason = "intervention left foreground app; event=$eventPackage"
-                dismissIntervention(resumeExternalMedia = false)
-                pauseWatchClock(reason)
-                if (currentTargetPackage != null) {
-                    suspendTargetSession(reason)
-                } else {
-                    currentMode = ScreenMode.OTHER
-                    hideBubble()
-                }
-                persistSession(force = true)
-                return
-            }
-
-            // Never toggle the overlay visibility here. The system shade should
-            // simply draw above this steady window while watch time remains paused.
+            // Do not dismiss from an event package name: Samsung's notification shade
+            // and Quick Panel can report helper-window packages unrelated to SystemUI.
+            // The timer's application-window check decides when the user really leaves.
             pauseWatchClock("accessibility event during intervention")
             hideBubble()
             return
@@ -767,7 +744,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
         persistSession(force = true)
         hideBubble()
-        bpResetPendingFor(packageName, keepRecent = true)
+        bpResetPendingFor(packageName)
         bpScheduleScan(packageName, 0L, "session begin")
     }
 
@@ -800,13 +777,13 @@ class MindScrollAccessibilityService : AccessibilityService() {
         tiktokNonVideoNavSuppressUntil = 0L
         facebookNonVideoNavSuppressUntil = 0L
         tiktokGestureCandidateUntil = 0L
-        bpResetPendingFor(target, keepRecent = true)
+        bpResetPendingFor(target)
         hideBubble()
     }
 
-    private fun hardEndSession(reason: String) {
-        diag("SESSION hard end reason=$reason")
-        pauseWatchClock("hard end: $reason")
+    private fun hardEndSession() {
+        diag("SESSION hard end reason=user chose No")
+        pauseWatchClock("hard end: user chose No")
         currentTargetPackage = null
         currentMode = ScreenMode.OTHER
         lastShortSurfaceSeenAt = 0L
@@ -896,6 +873,35 @@ class MindScrollAccessibilityService : AccessibilityService() {
         return runCatching {
             rootInActiveWindow?.packageName?.toString()
         }.getOrNull()
+    }
+
+    /**
+     * true = the target app still has an application window (a system panel may cover it)
+     * false = no target application window remains (Home/app switching)
+     * null = the window list is inconclusive; keep the interruption rather than guess
+     */
+    private fun targetHasApplicationWindow(target: String): Boolean? {
+        val list = runCatching { windows }.getOrNull() ?: return null
+        if (list.isEmpty()) return null
+        var unknownRoot = false
+        for (window in list) {
+            if (window.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+            val visiblePackage = runCatching { window.root?.packageName?.toString() }.getOrNull()
+            if (visiblePackage == null) {
+                unknownRoot = true
+                continue
+            }
+            if (visiblePackage == target) return true
+        }
+        return if (unknownRoot) null else false
+    }
+
+    private fun nodeIsChecked(node: AccessibilityNodeInfo): Boolean =
+        AccessibilityNodeInfoCompat.wrap(node).isChecked
+
+    @Suppress("DEPRECATION")
+    private fun recycleNodeCompat(node: AccessibilityNodeInfo) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) node.recycle()
     }
 
     private fun isTransientSystemPackage(packageName: String): Boolean {
@@ -1074,7 +1080,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         val label = nodeStateText(node)
         val wanted = expected.lowercase(Locale.ROOT)
         if (!label.contains(wanted)) return false
-        return node.isSelected || node.isChecked ||
+        return node.isSelected || nodeIsChecked(node) ||
             label.contains("selected") || label.contains("current") || label.contains("active")
     }
 
@@ -1157,14 +1163,13 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private fun bpState(packageName: String): BPTrackState =
         bpTrackStates.getOrPut(packageName) { BPTrackState() }
 
-    private fun bpResetPendingFor(packageName: String, keepRecent: Boolean) {
+    private fun bpResetPendingFor(packageName: String) {
         val state = bpState(packageName)
         state.pendingToken++
         state.pendingId = null
         state.pendingIsAd = false
         state.stableId = null
         state.lastDetectedAt = 0L
-        if (!keepRecent) state.recentIds.clear()
     }
 
     private fun bpCancelAllPending(reason: String) {
@@ -1686,7 +1691,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
                 if (wr >= 0.58f && hr >= 0.50f &&
                     (id.contains("video") || id.contains("player") || id.contains("media") || id.contains("reel"))) {
-                    if (largeVideo == null || bpNodeCoverage(n) > bpNodeCoverage(largeVideo!!)) largeVideo = n
+                    if (largeVideo == null || bpNodeCoverage(n) > bpNodeCoverage(largeVideo)) largeVideo = n
                 }
                 normalized?.let { if (it.length <= 180) stable.add(it) }
             }
@@ -1912,7 +1917,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                 primeFingerprint("IG", instagramFingerprint)
             }
             (event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED) &&
-                (exactPagerSource || surface.viewerOpen) -> {
+                event.eventType == AccessibilityEvent.TYPE_VIEW_SCROLLED -> {
                 collectPagerFallback("IG", instagramPager, dy, ScreenMode.INSTAGRAM_REELS)
             }
             else -> scheduleFingerprintTransition("IG", instagramFingerprint, ScreenMode.INSTAGRAM_REELS, directionHint)
@@ -2030,7 +2035,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                 // full-screen viewer was entered from Search/Explore.
                 if ((combined == "search" || combined.startsWith("search,") ||
                         combined.contains("search and explore") || combined == "explore") &&
-                    (node.isSelected || node.isChecked || combined.contains("selected") ||
+                    (node.isSelected || nodeIsChecked(node) || combined.contains("selected") ||
                         combined.contains("current") || id.contains("search") || id.contains("explore"))) {
                     exploreContext = true
                 }
@@ -2046,14 +2051,14 @@ class MindScrollAccessibilityService : AccessibilityService() {
                     searchScreenEvidence = true
                 }
                 if ((combined == "home" || combined.startsWith("home,")) &&
-                    (node.isSelected || node.isChecked || combined.contains("selected") || combined.contains("current"))) {
+                    (node.isSelected || nodeIsChecked(node) || combined.contains("selected") || combined.contains("current"))) {
                     homeTabSelected = true
                     nonVideoTabSelected = true
                 }
                 if ((combined == "profile" || combined.startsWith("profile,") ||
                         combined == "messages" || combined.startsWith("messages,") ||
                         combined == "inbox" || combined.startsWith("inbox,")) &&
-                    (node.isSelected || node.isChecked || combined.contains("selected") || combined.contains("current"))) {
+                    (node.isSelected || nodeIsChecked(node) || combined.contains("selected") || combined.contains("current"))) {
                     nonVideoTabSelected = true
                 }
 
@@ -2398,7 +2403,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                     (combined == "shorts selected") || combined.contains("shorts, selected")) {
                     shortsSelected = true
                 }
-                val selectedNav = node.isSelected || node.isChecked ||
+                val selectedNav = node.isSelected || nodeIsChecked(node) ||
                     combined.contains("selected") || combined.contains("current")
                 if (selectedNav && (
                         combined == "home" || combined.startsWith("home,") ||
@@ -2961,7 +2966,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                 // don't call them the swipe feed unless feed semantics are present.
                 if ((combined == "search" || combined == "profile" || combined == "inbox" ||
                         combined == "shop") &&
-                    (node.isSelected || node.isChecked || combined.contains("selected") || combined.contains("current"))) {
+                    (node.isSelected || nodeIsChecked(node) || combined.contains("selected") || combined.contains("current"))) {
                     searchOrProfileScreen = true
                     explicitNonFeedNav = true
                 }
@@ -3016,7 +3021,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         val viewer = !comments && !searchOrProfileScreen && !explicitNonFeedNav && (
             strongFeedPager ||
                 structuralFeed ||
-                (actions.size >= 3 && (largeVerticalContainer || largeMediaContainer || fullscreenMediaCandidate)) ||
+                (actions.size >= 3 && (largeVerticalContainer || largeMediaContainer)) ||
                 (semanticFeed && (actions.size >= 2 || largeVerticalContainer || largeMediaContainer))
             )
         return SurfaceState(viewer, comments, semanticFeed || structuralFeed)
@@ -3265,7 +3270,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                         normalized == "friends" || normalized.startsWith("friends,") ||
                         normalized == "notifications" || normalized.startsWith("notifications,") ||
                         normalized == "menu" || normalized.startsWith("menu,")) &&
-                    (node.isSelected || node.isChecked || normalized.contains("selected") || normalized.contains("current"))) {
+                    (node.isSelected || nodeIsChecked(node) || normalized.contains("selected") || normalized.contains("current"))) {
                     nonReelsNavSelected = true
                 }
 
@@ -4334,7 +4339,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         for (index in 0 until node.childCount) {
             val child = node.getChild(index) ?: continue
             val found = containsAccessiblePlayControl(child, depth + 1)
-            child.recycle()
+            recycleNodeCompat(child)
             if (found) return true
         }
         return false
@@ -4569,7 +4574,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                     resumeWatchClock("test intervention ended")
                     return@setOnClickListener
                 }
-                hardEndSession("user chose No")
+                hardEndSession()
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
         }
@@ -4678,6 +4683,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
     }
 
     private fun dismissIntervention(resumeExternalMedia: Boolean = false) {
+        interventionAbandonStreak = 0
         releaseInterventionPlayer()
         interventionView?.let { view ->
             runCatching { windowManager.removeView(view) }
@@ -4762,6 +4768,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     handler.removeCallbacks(longPressRunnable)
+                    if (event.actionMasked == MotionEvent.ACTION_UP && !moved && !longPressed) {
+                        view.performClick()
+                    }
                     true
                 }
                 else -> false
