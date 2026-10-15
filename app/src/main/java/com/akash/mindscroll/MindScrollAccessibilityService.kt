@@ -1,11 +1,14 @@
 package com.akash.mindscroll
 
+import android.app.KeyguardManager
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Color
+import android.graphics.Path
 import android.graphics.BitmapFactory
 import android.graphics.PixelFormat
 import android.graphics.Rect
@@ -19,6 +22,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -44,7 +49,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * MindScroll V28 — multi-device closed-test fixes.
+ * MindScroll V31 — system shade layering and intervention lifecycle fixes.
  *
  * The user-supplied BrainPal APK was statically inspected as a behavioral
  * reference. Its detector produces DetectionData(isDetected, videoIdentifier,
@@ -211,12 +216,33 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var bubbleMenuView: View? = null
     private var interventionView: View? = null
+    private var interventionTestMode = false
 
     private var hasTransientAudioFocus = false
     private var audioFocusRequest: AudioFocusRequest? = null
     private var interventionMediaPlayer: MediaPlayer? = null
     private var externalMediaPauseSent = false
-    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { /* transient reminder focus only */ }
+    private var externalMediaPausedViaTap = false
+
+    // Screen/lock state. Accessibility overlays can otherwise remain visible over
+    // the keyguard on some Android builds, so screen-off handling is explicit.
+    private var deviceScreenOffObserved = false
+    private var deviceScreenInteractive = true
+    private var deviceKeyguardLocked = false
+    private var deviceUnavailableActive = false
+    private var deviceStateReceiverRegistered = false
+
+    private val deviceStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                Intent.ACTION_SCREEN_OFF -> handleDeviceScreenOff()
+                Intent.ACTION_SCREEN_ON -> handleDeviceScreenOn()
+                Intent.ACTION_USER_PRESENT -> handleDeviceUserPresent()
+            }
+        }
+    }
+
+    private val audioFocusListener = AudioManager.OnAudioFocusChangeListener { /* intervention focus only */ }
 
     private var currentTargetPackage: String? = null
     private var currentMode = ScreenMode.OTHER
@@ -286,6 +312,51 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
     private val timerRunnable = object : Runnable {
         override fun run() {
+            // Safety net in case a device broadcast is delayed or missed. Never
+            // keep an accessibility overlay or watch clock active over the lockscreen.
+            if (!isDeviceInteractiveAndUnlocked()) {
+                handleDeviceUnavailable("timer detected screen off/locked")
+                handler.postDelayed(this, 500L)
+                return
+            }
+
+            // Keep the intervention stable while it is displayed. System UI shade
+            // windows do not count as leaving the foreground app; Home/another app does.
+            if (interventionShowing) {
+                val expectedForeground = if (interventionTestMode) {
+                    packageName
+                } else {
+                    currentTargetPackage
+                }
+                if (expectedForeground != null) {
+                    val foreground = resolveForegroundPackage()
+                    if (!foreground.isNullOrBlank() &&
+                        foreground != expectedForeground &&
+                        foreground != packageName &&
+                        !isTransientSystemPackage(foreground)
+                    ) {
+                        val reason = "intervention abandoned; foreground=$foreground"
+                        dismissIntervention(resumeExternalMedia = false)
+                        pauseWatchClock(reason)
+                        if (currentTargetPackage != null) {
+                            suspendTargetSession(reason)
+                        } else {
+                            currentMode = ScreenMode.OTHER
+                            hideBubble()
+                        }
+                        persistSessionIfNeeded()
+                        handler.postDelayed(this, 300L)
+                        return
+                    }
+                }
+
+                pauseWatchClock("intervention visible")
+                hideBubble()
+                persistSessionIfNeeded()
+                handler.postDelayed(this, 300L)
+                return
+            }
+
             if (!store.protectionEnabled) {
                 pauseWatchClock("protection disabled")
                 hideBubble()
@@ -422,12 +493,166 @@ class MindScrollAccessibilityService : AccessibilityService() {
             registerReceiver(controlReceiver, filter)
         }
 
-        diag("SERVICE connected V27")
+        val deviceFilter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(deviceStateReceiver, deviceFilter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(deviceStateReceiver, deviceFilter)
+        }
+        deviceStateReceiverRegistered = true
+
+        // Seed current state in case Accessibility was enabled while the phone was locked.
+        if (isDeviceInteractiveAndUnlocked()) {
+            deviceUnavailableActive = false
+        } else {
+            handleDeviceUnavailable("service connected while screen off/locked")
+        }
+
+        diag("SERVICE connected V31")
         handler.post(timerRunnable)
+    }
+
+    private fun isDeviceInteractiveAndUnlocked(): Boolean {
+        val powerInteractive = runCatching {
+            (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+        }.getOrDefault(false)
+        val keyguardLocked = runCatching {
+            (getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isKeyguardLocked
+        }.getOrDefault(true)
+
+        deviceScreenInteractive = powerInteractive
+        deviceKeyguardLocked = keyguardLocked
+        if (!powerInteractive) {
+            deviceScreenOffObserved = true
+        } else if (!keyguardLocked) {
+            // A confirmed interactive, unlocked state is authoritative even on
+            // devices that deliver SCREEN_ON before their power state settles.
+            deviceScreenOffObserved = false
+        }
+        return powerInteractive && !keyguardLocked && !deviceScreenOffObserved
+    }
+
+    private fun handleDeviceScreenOff() {
+        deviceScreenOffObserved = true
+        deviceScreenInteractive = false
+        deviceKeyguardLocked = true
+        handleDeviceUnavailable("screen off")
+    }
+
+    private fun handleDeviceScreenOn() {
+        deviceScreenOffObserved = false
+        isDeviceInteractiveAndUnlocked()
+        if (deviceScreenInteractive && !deviceKeyguardLocked) {
+            handleDeviceAvailable("screen on without lockscreen")
+        } else {
+            handleDeviceUnavailable("screen on while keyguard locked")
+        }
+    }
+
+    private fun handleDeviceUserPresent() {
+        deviceScreenOffObserved = false
+        deviceScreenInteractive = runCatching {
+            (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive
+        }.getOrDefault(false)
+        // USER_PRESENT is sent after the user has passed the keyguard.
+        deviceKeyguardLocked = false
+        if (deviceScreenInteractive) {
+            handleDeviceAvailable("user unlocked device")
+        } else {
+            handleDeviceUnavailable("user-present broadcast while screen inactive")
+        }
+    }
+
+    private fun handleDeviceUnavailable(reason: String) {
+        val firstEntry = !deviceUnavailableActive
+        deviceUnavailableActive = true
+
+        // pauseWatchClock now also freezes the reminder deadline if the elapsed
+        // timer was already stopped before the screen-off/lock event.
+        pauseWatchClock(reason)
+
+        if (interventionShowing || interventionMediaPlayer != null) {
+            // Do not resume the social app automatically when locking the phone.
+            // Releasing the player and removing the accessibility overlay stops
+            // both the motivational video and its audio immediately.
+            dismissIntervention(resumeExternalMedia = false)
+        }
+        hideBubble()
+
+        if (firstEntry) {
+            persistSession(force = true)
+            diag("DEVICE unavailable reason=$reason")
+        }
+    }
+
+    private fun handleDeviceAvailable(reason: String) {
+        deviceUnavailableActive = false
+        if (!::store.isInitialized) return
+
+        if (store.protectionEnabled &&
+            currentTargetPackage != null &&
+            isShortVideoMode(currentMode) &&
+            !interventionShowing
+        ) {
+            // First account for the time spent locked/profile-paused. Then compare
+            // the shifted reminder deadline so time spent with the screen off is
+            // not treated as watch time.
+            resumeWatchClock(reason)
+            val now = System.currentTimeMillis()
+            if (store.remindersEnabled && nextInterventionAt > 0L && now >= nextInterventionAt) {
+                showIntervention(testMode = false)
+            } else {
+                updateBubble()
+            }
+        }
+        persistSession(force = true)
+        diag("DEVICE available reason=$reason")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         event ?: return
+        if (!isDeviceInteractiveAndUnlocked()) {
+            handleDeviceUnavailable("accessibility event while screen off/locked")
+            return
+        }
+        if (interventionShowing) {
+            // A notification/Quick Settings event belongs to Android System UI
+            // and is allowed to layer above the splash. An event from a different
+            // real app (for example, the launcher after Home) ends the intervention.
+            // Ignore MindScroll's own overlay package so it cannot dismiss itself.
+            val eventPackage = event.packageName?.toString().orEmpty()
+            val expectedPackage = if (interventionTestMode) packageName else currentTargetPackage
+            if (
+                !expectedPackage.isNullOrBlank() &&
+                eventPackage.isNotBlank() &&
+                eventPackage != expectedPackage &&
+                eventPackage != packageName &&
+                !isTransientSystemPackage(eventPackage)
+            ) {
+                val reason = "intervention left foreground app; event=$eventPackage"
+                dismissIntervention(resumeExternalMedia = false)
+                pauseWatchClock(reason)
+                if (currentTargetPackage != null) {
+                    suspendTargetSession(reason)
+                } else {
+                    currentMode = ScreenMode.OTHER
+                    hideBubble()
+                }
+                persistSession(force = true)
+                return
+            }
+
+            // Never toggle the overlay visibility here. The system shade should
+            // simply draw above this steady window while watch time remains paused.
+            pauseWatchClock("accessibility event during intervention")
+            hideBubble()
+            return
+        }
         if (!store.protectionEnabled) {
             pauseWatchClock("protection disabled")
             hideBubble()
@@ -675,6 +900,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private fun isTransientSystemPackage(packageName: String): Boolean {
         return packageName == "android" ||
             packageName == "com.android.systemui" ||
+            packageName.contains("systemui", ignoreCase = true) ||
             packageName == "com.android.permissioncontroller" ||
             packageName == "com.google.android.permissioncontroller" ||
             packageName == "com.google.android.inputmethod.latin" ||
@@ -707,18 +933,34 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
     private fun resumeWatchClock(reason: String) {
         if (!store.protectionEnabled || !isShortVideoMode(currentMode)) return
+        if (interventionShowing) return
+
+        // Refresh the real device state before checking the cached flag.
+        // This prevents the timer from remaining frozen after the user
+        // presses "Yes — continue".
+        if (!isDeviceInteractiveAndUnlocked()) {
+            deviceUnavailableActive = true
+            return
+        }
+
+        // Clear a stale unavailable state once the device is usable again.
+        deviceUnavailableActive = false
+
+        // Do not start a second watch-time segment.
         if (watchSegmentStartedAt > 0L) return
+
         val now = System.currentTimeMillis()
+
+        // Preserve the remaining reminder time during a genuine pause.
         if (interventionPausedAt > 0L && nextInterventionAt > 0L) {
             val pausedFor = (now - interventionPausedAt).coerceAtLeast(0L)
-            // Shift both ends of the reminder window. This keeps the interval
-            // length constant so Home's progress ring and live setting changes
-            // are based only on actual short-video watch time.
             sessionStartedAt += pausedFor
             nextInterventionAt += pausedFor
         }
+
         interventionPausedAt = 0L
         watchSegmentStartedAt = now
+
         diag("WATCH resume reason=$reason sessionMs=$sessionWatchedMs")
     }
 
@@ -734,13 +976,19 @@ class MindScrollAccessibilityService : AccessibilityService() {
     }
 
     private fun pauseWatchClock(reason: String) {
-        val started = watchSegmentStartedAt
-        if (started <= 0L) return
         val now = System.currentTimeMillis()
-        val delta = (now - started).coerceIn(0L, 10 * 60_000L)
-        watchSegmentStartedAt = 0L
-        sessionWatchedMs += delta
-        store.addTodayWatchTime(delta, currentTargetPackage)
+        val started = watchSegmentStartedAt
+        var delta = 0L
+        if (started > 0L) {
+            delta = (now - started).coerceIn(0L, 10 * 60_000L)
+            watchSegmentStartedAt = 0L
+            sessionWatchedMs += delta
+            store.addTodayWatchTime(delta, currentTargetPackage)
+        }
+
+        // Pause the reminder window even when the watch clock was already paused.
+        // Previously an early return here let the reminder deadline keep advancing
+        // during an intervention or while the device was locked.
         if (nextInterventionAt > 0L && interventionPausedAt == 0L) {
             interventionPausedAt = now
         }
@@ -3864,6 +4112,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
     private fun shouldBubbleBeVisible(): Boolean {
         if (currentTargetPackage == null || !store.protectionEnabled) return false
+        if (interventionShowing || deviceScreenOffObserved || !deviceScreenInteractive || deviceKeyguardLocked) return false
         return isShortVideoMode(currentMode)
     }
 
@@ -4002,16 +4251,124 @@ class MindScrollAccessibilityService : AccessibilityService() {
     // Intervention overlay
     // ---------------------------------------------------------------------
 
+    /**
+     * V29: Some Android builds and social-app versions ignore MEDIA_PAUSE when
+     * the video is not exposed through a controllable media session. On every
+     * Android manufacturer, Instagram Reels and TikTok therefore get a short
+     * tap on the detected player surface before the intervention overlay is
+     * drawn. The overlay is added only after the gesture completes, so it cannot
+     * intercept the tap. If gesture injection is rejected, media-key pause is
+     * used as a fallback. This remains best-effort because apps can change tap
+     * behavior between versions.
+     */
     private fun showIntervention(testMode: Boolean) {
         if (interventionShowing) return
+        if (!isDeviceInteractiveAndUnlocked()) {
+            handleDeviceUnavailable("intervention requested while screen off/locked")
+            return
+        }
         if (!testMode && !store.remindersEnabled) return
         interventionShowing = true
+        interventionTestMode = testMode
         performConfirmHaptic()
-        if (!testMode) muteMediaForIntervention()
         exitCheckToken++
-        if (!testMode) pauseWatchClock("intervention shown")
+        // Pause for test and real interventions alike so elapsed watch time never
+        // includes the motivational video or reflection countdown.
+        pauseWatchClock("intervention shown")
         hideBubble()
 
+        if (!testMode && shouldUseSurfaceTapPause()) {
+            if (isShortVideoPlayerAlreadyPaused()) {
+                // Avoid toggling a clearly-paused player back into playback.
+                diag("MEDIA player already paused; skipped surface tap")
+                showInterventionOverlay(testMode)
+                return
+            }
+            val accepted = dispatchShortVideoSurfaceTap { completed ->
+                if (interventionShowing) {
+                    if (completed) {
+                        externalMediaPausedViaTap = true
+                        showInterventionOverlay(testMode)
+                    } else {
+                        // Gesture injection was cancelled by the system; fall
+                        // back to Android media controls instead of losing the reminder.
+                        externalMediaPausedViaTap = false
+                        sendMediaPauseKey()
+                        showInterventionOverlay(testMode)
+                    }
+                }
+            }
+            if (accepted) return
+            // dispatchGesture() rejected the tap synchronously: use media keys.
+        }
+
+        if (!testMode) sendMediaPauseKey()
+        showInterventionOverlay(testMode)
+    }
+
+    private fun shouldUseSurfaceTapPause(): Boolean {
+        // Apply the same fallback to supported feeds on Samsung, Honor, Xiaomi,
+        // Pixel, and other Android devices; do not gate by manufacturer.
+        val supportedFeed = currentMode == ScreenMode.INSTAGRAM_REELS ||
+            currentMode == ScreenMode.TIKTOK_FEED
+        return supportedFeed && store.muteDuringIntervention
+    }
+
+    /** Best-effort guard: don't toggle if the active UI clearly exposes a Play control. */
+    private fun isShortVideoPlayerAlreadyPaused(): Boolean {
+        val root = rootInActiveWindow ?: return false
+        return runCatching { containsAccessiblePlayControl(root, 0) }.getOrDefault(false)
+    }
+
+    private fun containsAccessiblePlayControl(node: AccessibilityNodeInfo, depth: Int): Boolean {
+        if (depth > 18) return false
+        val description = node.contentDescription?.toString()?.trim()?.lowercase(Locale.US).orEmpty()
+        val text = node.text?.toString()?.trim()?.lowercase(Locale.US).orEmpty()
+        val viewId = node.viewIdResourceName?.substringAfterLast('/')?.lowercase(Locale.US).orEmpty()
+        val explicitPlayLabel = description in setOf("play", "play video", "play reel", "resume", "resume video", "resume playback") ||
+            text in setOf("play", "play video", "play reel", "resume", "resume video", "resume playback") ||
+            viewId in setOf("play_button", "play_video_button", "play_icon")
+        if ((node.isClickable || node.isFocusable) && explicitPlayLabel) return true
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val found = containsAccessiblePlayControl(child, depth + 1)
+            child.recycle()
+            if (found) return true
+        }
+        return false
+    }
+
+    private fun dispatchShortVideoSurfaceTap(onResult: (Boolean) -> Unit): Boolean {
+        val metrics = resources.displayMetrics
+        val x = metrics.widthPixels * 0.50f
+        val y = metrics.heightPixels * 0.43f
+        val path = Path().apply {
+            moveTo(x, y)
+            lineTo(x, y)
+        }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, 85L))
+            .build()
+
+        return runCatching {
+            dispatchGesture(
+                gesture,
+                object : AccessibilityService.GestureResultCallback() {
+                    override fun onCompleted(gestureDescription: GestureDescription?) {
+                        onResult(true)
+                    }
+
+                    override fun onCancelled(gestureDescription: GestureDescription?) {
+                        onResult(false)
+                    }
+                },
+                handler
+            )
+        }.getOrDefault(false)
+    }
+
+    private fun showInterventionOverlay(testMode: Boolean) {
         val root = FrameLayout(this).apply { setBackgroundColor(0xCC0A0A0E.toInt()) }
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -4086,8 +4443,8 @@ class MindScrollAccessibilityService : AccessibilityService() {
                     }
                 )
             } else {
-                // TextureView + MediaPlayer is more reliable than VideoView/SurfaceView
-                // inside accessibility overlays on Samsung and Honor/MagicOS devices.
+                // TextureView + MediaPlayer avoids several SurfaceView composition
+                // issues seen with videos rendered inside accessibility overlays.
                 val video = TextureView(this).apply {
                     val textureView = this
                     surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -4207,6 +4564,10 @@ class MindScrollAccessibilityService : AccessibilityService() {
             visibility = View.GONE
             setOnClickListener {
                 dismissIntervention()
+                if (testMode) {
+                    resumeWatchClock("test intervention ended")
+                    return@setOnClickListener
+                }
                 hardEndSession("user chose No")
                 performGlobalAction(GLOBAL_ACTION_HOME)
             }
@@ -4216,7 +4577,10 @@ class MindScrollAccessibilityService : AccessibilityService() {
             visibility = View.GONE
             setOnClickListener {
                 dismissIntervention(resumeExternalMedia = true)
-                if (testMode) return@setOnClickListener
+                if (testMode) {
+                    resumeWatchClock("test intervention continued")
+                    return@setOnClickListener
+                }
                 val now = System.currentTimeMillis()
                 // Keep the current session number/time. From this point onward the
                 // repeat-reminder setting owns the active countdown.
@@ -4239,6 +4603,10 @@ class MindScrollAccessibilityService : AccessibilityService() {
             setOnClickListener {
                 performConfirmHaptic()
                 dismissIntervention(resumeExternalMedia = true)
+                if (testMode) {
+                    resumeWatchClock("test intervention dismissed")
+                    return@setOnClickListener
+                }
                 if (!testMode) {
                     val now = System.currentTimeMillis()
                     currentReminderPhase = SettingsStore.REMINDER_PHASE_REPEAT
@@ -4266,16 +4634,28 @@ class MindScrollAccessibilityService : AccessibilityService() {
             }
         )
 
+        // V31: application overlays sit below Android's privileged System UI,
+        // allowing the notification shade/Quick Settings to remain visible above it.
+        val interventionWindowType =
+            if (Settings.canDrawOverlays(this)) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                // Fallback until the user grants "Display over other apps".
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            }
+
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            interventionWindowType,
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
 
         interventionView = root
         windowManager.addView(root, params)
+        diag("INTERVENTION windowType=$interventionWindowType overlayPermission=${Settings.canDrawOverlays(this)}")
+        if (!testMode) requestInterventionAudioFocus()
 
         var remaining = store.reflectionSeconds
         val countdownRunnable = object : Runnable {
@@ -4303,6 +4683,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         }
         interventionView = null
         interventionShowing = false
+        interventionTestMode = false
         restoreMediaAfterIntervention(resumeExternalMedia)
     }
 
@@ -4502,18 +4883,11 @@ class MindScrollAccessibilityService : AccessibilityService() {
         bubbleView?.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
     }
 
-    /**
-     * Pause the social-media session before the reminder starts. Some devices
-     * (notably Honor/MagicOS and some Samsung builds) do not pause Instagram from
-     * a normal transient audio-focus request alone, so V28 also sends MEDIA_PAUSE
-     * and requests exclusive transient focus.
-     */
-    private fun muteMediaForIntervention() {
+    /** Send an idempotent pause media-key command before the overlay covers the app. */
+    private fun sendMediaPauseKey() {
         if (!store.muteDuringIntervention) return
-
         runCatching {
             val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-
             audio.dispatchMediaKeyEvent(
                 KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PAUSE)
             )
@@ -4521,29 +4895,56 @@ class MindScrollAccessibilityService : AccessibilityService() {
                 KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PAUSE)
             )
             externalMediaPauseSent = true
+            diag("MEDIA pause-key sent package=$currentTargetPackage mode=$currentMode")
+        }.onFailure {
+            diag("MEDIA pause-key failed ${it.javaClass.simpleName}")
+        }
+    }
 
-            if (!hasTransientAudioFocus) {
-                val request = AudioFocusRequest.Builder(
-                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+    /**
+     * Use full focus gain while MindScroll's intervention is visible. On modern
+     * Android releases this gives media apps that follow the platform contract a
+     * stronger focus-loss signal than AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE.
+     * It remains best-effort: other apps can ignore media/focus controls.
+     */
+    private fun requestInterventionAudioFocus() {
+        if (!store.muteDuringIntervention || hasTransientAudioFocus) return
+        runCatching {
+            val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
+                        .build()
                 )
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MOVIE)
-                            .build()
-                    )
-                    .setAcceptsDelayedFocusGain(false)
-                    .setWillPauseWhenDucked(true)
-                    .setOnAudioFocusChangeListener(audioFocusListener, handler)
-                    .build()
+                .setAcceptsDelayedFocusGain(false)
+                .setWillPauseWhenDucked(true)
+                .setOnAudioFocusChangeListener(audioFocusListener, handler)
+                .build()
 
-                audioFocusRequest = request
-                hasTransientAudioFocus =
-                    audio.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-            }
+            val result = audio.requestAudioFocus(request)
+            hasTransientAudioFocus = result == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            audioFocusRequest = if (hasTransientAudioFocus) request else null
+            diag("MEDIA focus result=$result sdk=${Build.VERSION.SDK_INT} manufacturer=${Build.MANUFACTURER} mode=$currentMode")
         }.onFailure {
             hasTransientAudioFocus = false
             audioFocusRequest = null
+            diag("MEDIA focus request failed ${it.javaClass.simpleName}")
+        }
+    }
+
+    private fun sendMediaPlayKey() {
+        runCatching {
+            val audio = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            audio.dispatchMediaKeyEvent(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY)
+            )
+            audio.dispatchMediaKeyEvent(
+                KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY)
+            )
+        }.onFailure {
+            diag("MEDIA play-key failed ${it.javaClass.simpleName}")
         }
     }
 
@@ -4565,25 +4966,33 @@ class MindScrollAccessibilityService : AccessibilityService() {
         hasTransientAudioFocus = false
         audioFocusRequest = null
 
-        if (resumeExternalMedia &&
-            externalMediaPauseSent &&
-            audio != null &&
+        val shouldResumeTappedVideo = resumeExternalMedia &&
+            externalMediaPausedViaTap &&
             currentTargetPackage != null &&
             isShortVideoMode(currentMode)
-        ) {
+        val shouldResumeMediaKey = resumeExternalMedia &&
+            externalMediaPauseSent &&
+            !externalMediaPausedViaTap &&
+            currentTargetPackage != null &&
+            isShortVideoMode(currentMode)
+
+        if (shouldResumeTappedVideo) {
+            // Remove the intervention overlay first, then tap the same player
+            // surface to resume the video on any Android manufacturer. A PLAY
+            // media key is used if the OS rejects the resume gesture.
             handler.postDelayed({
-                runCatching {
-                    audio.dispatchMediaKeyEvent(
-                        KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY)
-                    )
-                    audio.dispatchMediaKeyEvent(
-                        KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY)
-                    )
+                if (currentTargetPackage == null || !isShortVideoMode(currentMode)) return@postDelayed
+                val accepted = dispatchShortVideoSurfaceTap { completed ->
+                    if (!completed) sendMediaPlayKey()
                 }
-            }, 160L)
+                if (!accepted) sendMediaPlayKey()
+            }, 180L)
+        } else if (shouldResumeMediaKey && audio != null) {
+            handler.postDelayed({ sendMediaPlayKey() }, 160L)
         }
 
         externalMediaPauseSent = false
+        externalMediaPausedViaTap = false
     }
 
     private fun decodeSampledBitmap(path: String, targetWidth: Int, targetHeight: Int): android.graphics.Bitmap? {
@@ -4679,6 +5088,10 @@ class MindScrollAccessibilityService : AccessibilityService() {
         hideBubble()
         dismissIntervention()
         runCatching { unregisterReceiver(controlReceiver) }
+        if (deviceStateReceiverRegistered) {
+            runCatching { unregisterReceiver(deviceStateReceiver) }
+            deviceStateReceiverRegistered = false
+        }
         super.onDestroy()
     }
 }
