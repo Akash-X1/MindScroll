@@ -13,8 +13,8 @@ android {
         applicationId = "com.akash.mindscroll"
         minSdk = 26
         targetSdk = 37
-        versionCode = 3
-        versionName = "1.1"
+        versionCode = 6
+        versionName = "1.4"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
