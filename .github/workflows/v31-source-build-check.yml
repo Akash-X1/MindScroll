@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - v31-build-validation
+      - v31-notification-shade-preservation-fix
   workflow_dispatch:
 
 permissions:
@@ -13,7 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out V31 validation branch
+      - name: Check out V31 shade-preservation fix
         uses: actions/checkout@v4
 
       - name: Set up Java
