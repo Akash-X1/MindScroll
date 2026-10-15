@@ -688,7 +688,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
             return
         }
 
-        val eventPackage = event.packageName?.toString().orEmpty()
         if (eventPackage.isBlank()) return
 
         if (isEnabledTarget(eventPackage)) {
