@@ -617,8 +617,28 @@ class MindScrollAccessibilityService : AccessibilityService() {
             return
         }
         if (interventionShowing) {
-            // Underlying app accessibility updates must not restart watch-time or
-            // recreate the bubble while the motivational intervention is on screen.
+            // The motivational video must not keep running over Home or another app.
+            // System UI (notification shade / Quick Settings) is transient and is
+            // deliberately ignored here so its panel appears above the splash.
+            val eventPackage = event.packageName?.toString().orEmpty()
+            val targetPackage = currentTargetPackage
+            if (!interventionTestMode &&
+                targetPackage != null &&
+                eventPackage.isNotBlank() &&
+                eventPackage != targetPackage &&
+                !isTransientSystemPackage(eventPackage)
+            ) {
+                val reason = "intervention left target app; event=$eventPackage"
+                dismissIntervention(resumeExternalMedia = false)
+                pauseWatchClock(reason)
+                suspendTargetSession(reason)
+                persistSession(force = true)
+                return
+            }
+
+            // Keep the watch clock paused while either the intervention or a
+            // transient Android system panel is visible. Do not hide/show the
+            // intervention here: that was the source of the flicker regression.
             pauseWatchClock("accessibility event during intervention")
             hideBubble()
             return
