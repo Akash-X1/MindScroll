@@ -332,6 +332,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
                     val foreground = resolveForegroundPackage()
                     if (!foreground.isNullOrBlank() &&
                         foreground != expectedForeground &&
+                        foreground != packageName &&
                         !isTransientSystemPackage(foreground)
                     ) {
                         val reason = "intervention abandoned; foreground=$foreground"
@@ -617,28 +618,34 @@ class MindScrollAccessibilityService : AccessibilityService() {
             return
         }
         if (interventionShowing) {
-            // The motivational video must not keep running over Home or another app.
-            // System UI (notification shade / Quick Settings) is transient and is
-            // deliberately ignored here so its panel appears above the splash.
+            // A notification/Quick Settings event belongs to Android System UI
+            // and is allowed to layer above the splash. An event from a different
+            // real app (for example, the launcher after Home) ends the intervention.
+            // Ignore MindScroll's own overlay package so it cannot dismiss itself.
             val eventPackage = event.packageName?.toString().orEmpty()
-            val targetPackage = currentTargetPackage
-            if (!interventionTestMode &&
-                targetPackage != null &&
+            val expectedPackage = if (interventionTestMode) packageName else currentTargetPackage
+            if (
+                !expectedPackage.isNullOrBlank() &&
                 eventPackage.isNotBlank() &&
-                eventPackage != targetPackage &&
+                eventPackage != expectedPackage &&
+                eventPackage != packageName &&
                 !isTransientSystemPackage(eventPackage)
             ) {
-                val reason = "intervention left target app; event=$eventPackage"
+                val reason = "intervention left foreground app; event=$eventPackage"
                 dismissIntervention(resumeExternalMedia = false)
                 pauseWatchClock(reason)
-                suspendTargetSession(reason)
+                if (currentTargetPackage != null) {
+                    suspendTargetSession(reason)
+                } else {
+                    currentMode = ScreenMode.OTHER
+                    hideBubble()
+                }
                 persistSession(force = true)
                 return
             }
 
-            // Keep the watch clock paused while either the intervention or a
-            // transient Android system panel is visible. Do not hide/show the
-            // intervention here: that was the source of the flicker regression.
+            // Never toggle the overlay visibility here. The system shade should
+            // simply draw above this steady window while watch time remains paused.
             pauseWatchClock("accessibility event during intervention")
             hideBubble()
             return
