@@ -23,6 +23,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import android.provider.Settings
 import android.view.Gravity
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
@@ -48,7 +49,7 @@ import kotlin.math.max
 import kotlin.math.roundToInt
 
 /**
- * MindScroll V30 — intervention timer and lockscreen lifecycle fixes.
+ * MindScroll V31 — system shade layering and intervention lifecycle fixes.
  *
  * The user-supplied BrainPal APK was statically inspected as a behavioral
  * reference. Its detector produces DetectionData(isDetected, videoIdentifier,
@@ -215,9 +216,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private var bubbleParams: WindowManager.LayoutParams? = null
     private var bubbleMenuView: View? = null
     private var interventionView: View? = null
-    private var interventionWindowParams: WindowManager.LayoutParams? = null
-    private var interventionHiddenForSystemUi = false
-    private var lastSystemUiPanelSignalAt = 0L
+    private var interventionTestMode = false
 
     private var hasTransientAudioFocus = false
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -321,11 +320,26 @@ class MindScrollAccessibilityService : AccessibilityService() {
                 return
             }
 
-            // The intervention is a deliberate pause: no watch-time flushing,
-            // floating-bubble recreation, or reminder scheduling while it is shown.
+            // Keep the intervention stable while it is displayed. System UI shade
+            // windows do not count as leaving the target app; Home/another app does.
             if (interventionShowing) {
-                // Temporarily remove the splash overlay when the Android system shade is expanded.
-                syncInterventionOverlayForSystemUi()
+                if (!interventionTestMode && currentTargetPackage != null) {
+                    val targetPackage = currentTargetPackage
+                    val foreground = resolveForegroundPackage()
+                    if (!foreground.isNullOrBlank() &&
+                        foreground != targetPackage &&
+                        !isTransientSystemPackage(foreground)
+                    ) {
+                        val reason = "intervention abandoned; foreground=$foreground"
+                        dismissIntervention(resumeExternalMedia = false)
+                        pauseWatchClock(reason)
+                        suspendTargetSession(reason)
+                        persistSessionIfNeeded()
+                        handler.postDelayed(this, 300L)
+                        return
+                    }
+                }
+
                 pauseWatchClock("intervention visible")
                 hideBubble()
                 persistSessionIfNeeded()
@@ -489,110 +503,8 @@ class MindScrollAccessibilityService : AccessibilityService() {
             handleDeviceUnavailable("service connected while screen off/locked")
         }
 
-        diag("SERVICE connected V30")
+        diag("SERVICE connected V31")
         handler.post(timerRunnable)
-    }
-
-    private fun isSystemUiPackage(packageName: String): Boolean {
-        return packageName == "android" ||
-            packageName == "com.android.systemui" ||
-            packageName.contains("systemui", ignoreCase = true)
-    }
-
-    /**
-     * Detect an expanded notification/Quick Settings window without relying on
-     * Samsung-only APIs. The TYPE_SYSTEM check also covers Android builds where
-     * the shade root does not expose a package name through AccessibilityWindowInfo.
-     */
-    private fun isSystemUiPanelExpanded(): Boolean {
-        val displayHeight = resources.displayMetrics.heightPixels.coerceAtLeast(1)
-        val minimumPanelHeight = (displayHeight * 0.22f).toInt().coerceAtLeast(1)
-
-        return runCatching {
-            windows.any { window ->
-                val bounds = Rect()
-                window.getBoundsInScreen(bounds)
-                if (bounds.height() < minimumPanelHeight) return@any false
-
-                val packageName = runCatching {
-                    window.root?.packageName?.toString().orEmpty()
-                }.getOrDefault("")
-                val isSystemWindow =
-                    window.type == AccessibilityWindowInfo.TYPE_SYSTEM ||
-                    isSystemUiPackage(packageName)
-
-                isSystemWindow && (window.isActive || window.isFocused)
-            }
-        }.getOrDefault(false)
-    }
-
-    private fun syncInterventionOverlayForSystemUi(event: AccessibilityEvent? = null) {
-        if (!interventionShowing || interventionView == null) return
-
-        val now = System.currentTimeMillis()
-        val eventPackage = event?.packageName?.toString().orEmpty()
-        val isSystemUiTransition = event != null &&
-            isSystemUiPackage(eventPackage) &&
-            (
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOWS_CHANGED ||
-                event.eventType == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED
-            )
-
-        if (isSystemUiTransition) {
-            lastSystemUiPanelSignalAt = now
-        }
-
-        if (isSystemUiPanelExpanded()) {
-            // Refresh the grace window while the panel is genuinely expanded.
-            lastSystemUiPanelSignalAt = now
-            setInterventionHiddenForSystemUi(true)
-            return
-        }
-
-        if (isSystemUiTransition) {
-            // Hide immediately when the panel starts opening; system windows can
-            // take a short time to become visible to the accessibility window list.
-            setInterventionHiddenForSystemUi(true)
-            return
-        }
-
-        if (interventionHiddenForSystemUi &&
-            now - lastSystemUiPanelSignalAt >= 1_000L
-        ) {
-            // The shade has closed (or no longer appears in the active system
-            // windows). Restore the motivational overlay after a short transition.
-            setInterventionHiddenForSystemUi(false)
-        }
-    }
-
-    private fun setInterventionHiddenForSystemUi(hidden: Boolean) {
-        if (interventionHiddenForSystemUi == hidden) return
-
-        val view = interventionView ?: return
-        val params = interventionWindowParams ?: return
-
-        val updated = runCatching {
-            if (hidden) {
-                // A hidden full-screen overlay must not intercept panel gestures/taps.
-                params.flags = params.flags or
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                view.visibility = View.INVISIBLE
-                windowManager.updateViewLayout(view, params)
-            } else {
-                params.flags = params.flags and
-                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
-                view.visibility = View.VISIBLE
-                windowManager.updateViewLayout(view, params)
-            }
-        }.isSuccess
-
-        if (updated) {
-            interventionHiddenForSystemUi = hidden
-            diag("SYSTEM_UI overlay hidden=$hidden")
-        } else {
-            diag("SYSTEM_UI overlay update failed hidden=$hidden")
-        }
     }
 
     private fun isDeviceInteractiveAndUnlocked(): Boolean {
@@ -699,8 +611,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
             return
         }
         if (interventionShowing) {
-            // Let Quick Settings and notifications become visible and receive touch input.
-            syncInterventionOverlayForSystemUi(event)
             // Underlying app accessibility updates must not restart watch-time or
             // recreate the bubble while the motivational intervention is on screen.
             pauseWatchClock("accessibility event during intervention")
@@ -954,6 +864,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private fun isTransientSystemPackage(packageName: String): Boolean {
         return packageName == "android" ||
             packageName == "com.android.systemui" ||
+            packageName.contains("systemui", ignoreCase = true) ||
             packageName == "com.android.permissioncontroller" ||
             packageName == "com.google.android.permissioncontroller" ||
             packageName == "com.google.android.inputmethod.latin" ||
@@ -4322,6 +4233,7 @@ class MindScrollAccessibilityService : AccessibilityService() {
         }
         if (!testMode && !store.remindersEnabled) return
         interventionShowing = true
+        interventionTestMode = testMode
         performConfirmHaptic()
         exitCheckToken++
         // Pause for test and real interventions alike so elapsed watch time never
@@ -4686,19 +4598,25 @@ class MindScrollAccessibilityService : AccessibilityService() {
             }
         )
 
+        val interventionWindowType =
+            if (Settings.canDrawOverlays(this)) {
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+            } else {
+                // Fallback until the user grants "Display over other apps".
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            }
+
         val params = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            interventionWindowType,
             WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
             PixelFormat.TRANSLUCENT
         )
 
         interventionView = root
-        interventionWindowParams = params
-        interventionHiddenForSystemUi = false
-        lastSystemUiPanelSignalAt = 0L
         windowManager.addView(root, params)
+        diag("INTERVENTION windowType=$interventionWindowType overlayPermission=${Settings.canDrawOverlays(this)}")
         if (!testMode) requestInterventionAudioFocus()
 
         var remaining = store.reflectionSeconds
@@ -4726,10 +4644,8 @@ class MindScrollAccessibilityService : AccessibilityService() {
             runCatching { windowManager.removeView(view) }
         }
         interventionView = null
-        interventionWindowParams = null
-        interventionHiddenForSystemUi = false
-        lastSystemUiPanelSignalAt = 0L
         interventionShowing = false
+        interventionTestMode = false
         restoreMediaAfterIntervention(resumeExternalMedia)
     }
 
