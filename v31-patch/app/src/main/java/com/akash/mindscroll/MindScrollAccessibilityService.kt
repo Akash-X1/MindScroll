@@ -321,19 +321,25 @@ class MindScrollAccessibilityService : AccessibilityService() {
             }
 
             // Keep the intervention stable while it is displayed. System UI shade
-            // windows do not count as leaving the target app; Home/another app does.
+            // windows do not count as leaving the foreground app; Home/another app does.
             if (interventionShowing) {
-                if (!interventionTestMode && currentTargetPackage != null) {
-                    val targetPackage = currentTargetPackage
+                val expectedForeground = if (interventionTestMode) {
+                    packageName
+                } else {
+                    currentTargetPackage
+                }
+                if (expectedForeground != null) {
                     val foreground = resolveForegroundPackage()
                     if (!foreground.isNullOrBlank() &&
-                        foreground != targetPackage &&
+                        foreground != expectedForeground &&
                         !isTransientSystemPackage(foreground)
                     ) {
                         val reason = "intervention abandoned; foreground=$foreground"
                         dismissIntervention(resumeExternalMedia = false)
                         pauseWatchClock(reason)
-                        suspendTargetSession(reason)
+                        if (currentTargetPackage != null) {
+                            suspendTargetSession(reason)
+                        }
                         persistSessionIfNeeded()
                         handler.postDelayed(this, 300L)
                         return
