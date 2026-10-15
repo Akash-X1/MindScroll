@@ -19,24 +19,36 @@ jobs:
           rm -rf package
           mkdir -p package/app/src/main/java/com/akash/mindscroll
           cp v31-patch/app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt package/app/src/main/java/com/akash/mindscroll/MindScrollAccessibilityService.kt
+          cp v31-patch/app/src/main/java/com/akash/mindscroll/MainActivity.kt package/app/src/main/java/com/akash/mindscroll/MainActivity.kt
           cat > package/README.txt <<'EOF'
-          MindScroll V31 — Android System UI overlay fix
-          
+          MindScroll V31 — System UI layering and intervention lifecycle fix
+
+          WHAT THIS PATCH CHANGES
+          - Removes the previous hide/show behavior that caused splash flicker.
+          - Uses an application overlay so Android's system shade can appear above the splash after overlay permission is enabled.
+          - Dismisses the real motivational intervention if the user leaves the target app, including Home.
+          - Shows "MindScroll V31 • Beta" on the Settings screen.
+          - Keeps the watch timer paused while the intervention is visible.
+
           HOW TO APPLY
-          1. Close Android Studio or leave the project open.
-          2. Extract this ZIP directly into:
-             D:\AndroidProjects\MindScroll
-          3. Allow Windows to replace:
+          1. Extract this ZIP directly into D:\AndroidProjects\MindScroll.
+          2. Allow Windows to replace both Kotlin files:
              app\src\main\java\com\akash\mindscroll\MindScrollAccessibilityService.kt
-          4. In app/build.gradle.kts, set:
+             app\src\main\java\com\akash\mindscroll\MainActivity.kt
+          3. Open app\src\main\AndroidManifest.xml. Immediately after the opening <manifest ...> line, add:
+             <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+             Do not remove other permissions or entries.
+          4. Open app\build.gradle.kts and set:
              versionCode = 6
              versionName = "1.4"
-             (This assumes your current V30 release used versionCode 5 / versionName 1.3.)
-          5. In Android Studio, click Build > Make Project and fix any build errors before installing.
-          6. Test the motivational intervention, pull down Quick Settings from the top-right, then notifications from the top-left. Confirm the panel is visible/usable and the splash returns when the panel closes.
-          7. If the tests pass, generate a newly signed Android App Bundle (AAB). The old V30 AAB does not contain this fix.
-          
-          This ZIP contains only the replacement Kotlin file and this README. It does not include signing keys, a built APK/AAB, or a full Android Studio project. Source change is not claimed to be compiled or device-tested.
+             (V30 was versionCode 5 / versionName 1.3; if your current console release differs, use the next unused code.)
+          5. Android Studio: Build > Make Project. Fix any build errors before installing.
+          6. Install/open the app. Go to Settings > System panel support > Allow system panel overlay, then enable "Allow display over other apps" for MindScroll in Android Settings.
+          7. Test: trigger the intervention, pull Quick Settings from the top-right and notifications from the top-left. The splash should remain steady underneath the system panel. Close the panel; the splash should remain.
+          8. While the intervention is active, go to Home or another app. The intervention should dismiss and not linger over Home.
+          9. After tests pass, generate a new signed AAB. Do not upload the old V30 AAB.
+
+          This ZIP contains source files only. It does not include a signed APK/AAB or signing keys. The code has not been compiled or device-tested here.
           EOF
           (cd package && zip -r ../MindScroll_V31_SystemUi_Fix.zip app README.txt)
       - name: Upload ZIP artifact
