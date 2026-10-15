@@ -99,7 +99,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
 
         // Pager state stability. Instagram may temporarily expose an incomplete
         // accessibility tree while a Reel snaps into place.
-        private const val PAGER_TREE_GRACE_MS = 850L
         private const val OPEN_SETTLE_MS = 400L
         private const val OPEN_REPOSITION_MS = 120L
         private const val FALLBACK_SCROLL_SETTLE_MS = 220L
@@ -107,13 +106,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
         private const val MIN_COUNT_INTERVAL_MS = 260L
         private const val GENERIC_GESTURE_COOLDOWN_MS = 430L
         private const val EXPLORE_CONTEXT_MEMORY_MS = 60_000L
-        private const val SURFACE_DISPLAY_GRACE_MS = 0L
-        private const val WATCHDOG_AWAY_CONFIRM_MS = 650L
-        private const val SURFACE_WATCHDOG_INTERVAL_MS = 650L
         private const val SURFACE_REFRESH_MIN_GAP_MS = 280L
         private const val YOUTUBE_COMMENT_GUARD_MS = 2_000L
         private const val YOUTUBE_COUNT_CONFIRM_MS = 520L
-        private const val TIKTOK_IDENTITY_POLL_MS = 450L
         private const val TIKTOK_IDENTITY_STABLE_MS = 320L
         private const val TIKTOK_CONTENT_BURST_GAP_MS = 520L
         private const val TIKTOK_CONTENT_SETTLE_MS = 230L
@@ -263,7 +258,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
     private val surfaceRefreshTokens = HashMap<String, Int>()
     private val surfaceRefreshPending = HashSet<String>()
     private val lastSurfaceRefreshAt = HashMap<String, Long>()
-    private var lastSurfaceWatchdogAt = 0L
     private var instagramExploreContextSeenAt = 0L
     private var instagramStrictPagerVisible = false
     private var lastInstagramNavigationSignalAt = 0L
@@ -1376,9 +1370,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
             .getOrNull().orEmpty().filter { it.isVisibleToUser }
     }
 
-    private fun bpVisibleBySimpleId(root: AccessibilityNodeInfo, packageName: String, simpleId: String): List<AccessibilityNodeInfo> =
-        bpVisibleById(root, "$packageName:id/$simpleId")
-
     private fun bpBestCentered(nodes: List<AccessibilityNodeInfo>): AccessibilityNodeInfo? {
         if (nodes.isEmpty()) return null
         val screenW = resources.displayMetrics.widthPixels.coerceAtLeast(1)
@@ -1455,40 +1446,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
         val material = pieces.filter { it.isNotBlank() }.joinToString("|")
         if (material.isBlank()) return ""
         return prefix + "_" + Integer.toHexString(material.hashCode())
-    }
-
-    private fun bpAnyVisibleText(root: AccessibilityNodeInfo, needles: List<String>, maxNodes: Int = 320): Boolean {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        var visited = 0
-        while (queue.isNotEmpty() && visited < maxNodes) {
-            val n = queue.removeFirst()
-            visited++
-            if (n.isVisibleToUser) {
-                val text = ((n.text?.toString().orEmpty()) + " " + (n.contentDescription?.toString().orEmpty()))
-                    .lowercase(Locale.ROOT)
-                if (needles.any { text.contains(it) }) return true
-            }
-            for (i in 0 until n.childCount) n.getChild(i)?.let(queue::addLast)
-        }
-        return false
-    }
-
-    private fun bpAnySelectedLabel(root: AccessibilityNodeInfo, labels: Set<String>, maxNodes: Int = 260): Boolean {
-        val queue = ArrayDeque<AccessibilityNodeInfo>()
-        queue.add(root)
-        var visited = 0
-        while (queue.isNotEmpty() && visited < maxNodes) {
-            val n = queue.removeFirst()
-            visited++
-            if (n.isVisibleToUser && n.isSelected) {
-                val raw = ((n.text?.toString().orEmpty()) + " " + (n.contentDescription?.toString().orEmpty()))
-                    .trim().lowercase(Locale.ROOT)
-                if (labels.any { raw == it || raw.startsWith("$it,") || raw.contains("$it tab") }) return true
-            }
-            for (i in 0 until n.childCount) n.getChild(i)?.let(queue::addLast)
-        }
-        return false
     }
 
     private fun bpDetectInstagram(root: AccessibilityNodeInfo): BPDetection {
@@ -1723,76 +1680,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
     // ---------------------------------------------------------------------
     // Instagram detector — pager-index based
     // ---------------------------------------------------------------------
-
-    private fun handleInstagramEvent(event: AccessibilityEvent) {
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> {
-                refreshTargetSurfaceWithRetries(INSTAGRAM)
-            }
-
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                requestSurfaceRefresh(INSTAGRAM, 110L)
-                // Search/Explore full-screen videos do not always expose the same
-                // pager index callbacks as the dedicated Reels tab.  Once that
-                // full-screen surface is already verified, a settled metadata
-                // change is a second, conservative way to confirm a new video.
-                if (currentMode == ScreenMode.INSTAGRAM_REELS && !instagramStrictPagerVisible) {
-                    scheduleFingerprintTransition("IG", instagramFingerprint, ScreenMode.INSTAGRAM_REELS, 0)
-                }
-            }
-
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                val now = System.currentTimeMillis()
-                val nav = instagramNavigationDestination(event.source)
-                if (nav != null && nav != "reels") {
-                    if (nav == "search" || nav == "explore") {
-                        instagramExploreContextSeenAt = now
-                        diag("IG EXPLORE context armed by click")
-                    } else {
-                        // Instagram can leave the old Reel pager mounted for a
-                        // short moment after Home/Profile/Messages is selected.
-                        // Suppress re-arming during that stale-tree window.
-                        instagramNonVideoNavSuppressUntil = now + NON_VIDEO_NAV_SUPPRESS_MS
-                    }
-                    forceLeaveShortSurface("IG", "navigation=$nav")
-                    refreshTargetSurfaceWithRetries(INSTAGRAM)
-                } else if (isInstagramSearchNavigationClick(event.source)) {
-                    instagramExploreContextSeenAt = now
-                    diag("IG EXPLORE context armed by click")
-                    forceLeaveShortSurface("IG", "search navigation")
-                    refreshTargetSurfaceWithRetries(INSTAGRAM)
-                } else if (instagramExploreContextSeenAt > 0L &&
-                    now - instagramExploreContextSeenAt <= EXPLORE_CONTEXT_MEMORY_MS &&
-                    currentMode != ScreenMode.INSTAGRAM_REELS
-                ) {
-                    // A tap inside Search/Explore usually means a grid item was
-                    // opened. Keep the context alive while Instagram swaps the
-                    // grid for its full-screen media viewer.
-                    instagramExploreContextSeenAt = now
-                }
-            }
-
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> handleInstagramPagerScroll(event)
-
-            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
-                val nav = instagramNavigationDestination(event.source)
-                if (nav != null && nav != "reels") {
-                    val now = System.currentTimeMillis()
-                    if (nav == "search" || nav == "explore") {
-                        instagramExploreContextSeenAt = now
-                    } else {
-                        instagramNonVideoNavSuppressUntil = now + NON_VIDEO_NAV_SUPPRESS_MS
-                    }
-                    forceLeaveShortSurface("IG", "selected navigation=$nav")
-                    refreshTargetSurfaceWithRetries(INSTAGRAM)
-                } else {
-                    if (nav == "reels") instagramNonVideoNavSuppressUntil = 0L
-                    handleInstagramPagerScroll(event)
-                }
-            }
-        }
-    }
 
     private fun refreshInstagramSurface() {
         if (currentTargetPackage != INSTAGRAM) return
@@ -2185,53 +2072,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
     // ---------------------------------------------------------------------
     // YouTube Shorts detector — same pager-index model where available
     // ---------------------------------------------------------------------
-
-    private fun handleYouTubeEvent(event: AccessibilityEvent) {
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> refreshTargetSurfaceWithRetries(YOUTUBE)
-
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                // Content changes alone are never a watched-video transition.
-                // Likes/progress/captions/comments can all rebuild the tree while
-                // the same Short remains visible. V16 only counts after a user
-                // scroll gesture AND a stable final video identity change.
-                requestSurfaceRefresh(YOUTUBE, 140L)
-            }
-
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                if (isYouTubeCommentInteraction(event.source)) {
-                    youtubeCommentGuardUntil = System.currentTimeMillis() + YOUTUBE_COMMENT_GUARD_MS
-                    cancelYouTubePendingCount("comment control clicked")
-                    setMode(ScreenMode.YOUTUBE_COMMENTS, "YT comment control clicked")
-                    hideBubble()
-                    refreshTargetSurfaceWithRetries(YOUTUBE)
-                } else {
-                    val destination = youtubeNavigationDestination(event.source)
-                    if (destination != null && destination != "shorts") {
-                        youtubeNonVideoNavSuppressUntil = System.currentTimeMillis() + NON_VIDEO_NAV_SUPPRESS_MS
-                        forceLeaveShortSurface("YT", "navigation=$destination")
-                        refreshTargetSurfaceWithRetries(YOUTUBE)
-                    } else if (destination == "shorts") {
-                        youtubeNonVideoNavSuppressUntil = 0L
-                    }
-                }
-            }
-
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> handleYouTubePagerScroll(event)
-            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
-                val destination = youtubeNavigationDestination(event.source)
-                if (destination != null && destination != "shorts") {
-                    youtubeNonVideoNavSuppressUntil = System.currentTimeMillis() + NON_VIDEO_NAV_SUPPRESS_MS
-                    forceLeaveShortSurface("YT", "selected navigation=$destination")
-                    refreshTargetSurfaceWithRetries(YOUTUBE)
-                } else {
-                    if (destination == "shorts") youtubeNonVideoNavSuppressUntil = 0L
-                    handleYouTubePagerScroll(event)
-                }
-            }
-        }
-    }
 
     private fun refreshYouTubeSurface() {
         if (currentTargetPackage != YOUTUBE) return
@@ -2630,71 +2470,9 @@ class MindScrollAccessibilityService : AccessibilityService() {
         return false
     }
 
-    private fun isLikelyFullScreenPageEvent(event: AccessibilityEvent): Boolean {
-        if (event.fromIndex >= 0 || event.toIndex >= 0 || event.currentItemIndex >= 0) return true
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && event.scrollDeltaY != 0) return true
-        val root = rootInActiveWindow ?: return false
-        var node = event.source
-        var depth = 0
-        while (node != null && depth < 10) {
-            if (isLargeScrollableVideoContainer(node, root)) return true
-            node = node.parent
-            depth++
-        }
-        return false
-    }
-
     // ---------------------------------------------------------------------
     // TikTok detector — full-screen pager / ViewPager2 model
     // ---------------------------------------------------------------------
-
-    private fun handleTikTokEvent(event: AccessibilityEvent, packageName: String) {
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED -> refreshTargetSurfaceWithRetries(packageName)
-
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
-                requestSurfaceRefresh(packageName, 140L)
-                // TikTok produces a constant stream of content changes while one
-                // video is playing. Content changes alone are never a count.
-                // After a real scroll gesture, however, they are useful as a cue
-                // to run the same stable-final-video confirmation used below.
-                if ((currentMode == ScreenMode.TIKTOK_FEED || tiktokPager.active) &&
-                    System.currentTimeMillis() <= tiktokGestureCandidateUntil) {
-                    scheduleStableGestureFingerprint(
-                        platform = "TT",
-                        state = tiktokFingerprint,
-                        mode = ScreenMode.TIKTOK_FEED,
-                        directionHint = 0
-                    )
-                }
-            }
-
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                val destination = tiktokNavigationDestination(event.source)
-                if (destination != null && destination !in setOf("for you", "following", "friends", "home")) {
-                    tiktokNonVideoNavSuppressUntil = System.currentTimeMillis() + NON_VIDEO_NAV_SUPPRESS_MS
-                    forceLeaveShortSurface("TT", "navigation=$destination")
-                    refreshTargetSurfaceWithRetries(packageName)
-                } else if (destination != null) {
-                    tiktokNonVideoNavSuppressUntil = 0L
-                }
-            }
-
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> handleTikTokPagerScroll(event, packageName)
-            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
-                val destination = tiktokNavigationDestination(event.source)
-                if (destination != null && destination !in setOf("for you", "following", "friends", "home")) {
-                    tiktokNonVideoNavSuppressUntil = System.currentTimeMillis() + NON_VIDEO_NAV_SUPPRESS_MS
-                    forceLeaveShortSurface("TT", "selected navigation=$destination")
-                    refreshTargetSurfaceWithRetries(packageName)
-                } else {
-                    if (destination != null) tiktokNonVideoNavSuppressUntil = 0L
-                    handleTikTokPagerScroll(event, packageName)
-                }
-            }
-        }
-    }
 
     private fun refreshTikTokSurface(packageName: String) {
         if (currentTargetPackage != packageName) return
@@ -2855,53 +2633,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
             depth++
         }
         return false
-    }
-
-    private fun recordTikTokContentBurst() {
-        val now = System.currentTimeMillis()
-        if (now > tiktokGestureCandidateUntil) return
-        if (now - tiktokContentBurstLastAt > TIKTOK_CONTENT_BURST_GAP_MS) {
-            tiktokContentBurstStartedAt = now
-            tiktokContentBurstEvents = 1
-        } else {
-            tiktokContentBurstEvents++
-        }
-        tiktokContentBurstLastAt = now
-        val token = ++tiktokContentBurstToken
-        handler.postDelayed({
-            if (token != tiktokContentBurstToken ||
-                currentMode != ScreenMode.TIKTOK_FEED || interventionShowing ||
-                System.currentTimeMillis() > tiktokGestureCandidateUntil) return@postDelayed
-
-            val events = tiktokContentBurstEvents
-            tiktokContentBurstEvents = 0
-            if (events < TIKTOK_CONTENT_MIN_EVENTS) {
-                diag("TT content burst ignored events=$events")
-                return@postDelayed
-            }
-
-            // If the fingerprint is available and unchanged, the burst was
-            // probably only player chrome/progress updating. If metadata changed
-            // (or TikTok exposes no usable identity at all), one burst represents
-            // one snapped feed transition.
-            val fp = buildPlatformVideoFingerprint("TT")
-            if (fp != 0 && tiktokFingerprint.current != 0 && fp == tiktokFingerprint.current) {
-                diag("TT content burst same fingerprint; no-count")
-                return@postDelayed
-            }
-            if (fp != 0) {
-                tiktokFingerprint.current = fp
-                rememberFingerprint(tiktokFingerprint, fp)
-            }
-            if (System.currentTimeMillis() - lastTikTokNavigationSignalAt < 700L) {
-                diag("TT content burst deduped against navigation")
-                return@postDelayed
-            }
-            acceptForwardTransition("TT", ScreenMode.TIKTOK_FEED, "content-burst")
-            lastTikTokNavigationSignalAt = System.currentTimeMillis()
-            tiktokGestureCandidateUntil = 0L
-            updateBubble()
-        }, TIKTOK_CONTENT_SETTLE_MS)
     }
 
     private fun scanTikTokSurface(): SurfaceState {
@@ -3074,36 +2805,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
     // ---------------------------------------------------------------------
     // Facebook Reels detector — conservative full-screen Reel surface model
     // ---------------------------------------------------------------------
-
-    private fun handleFacebookEvent(event: AccessibilityEvent) {
-        when (event.eventType) {
-            AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED,
-            AccessibilityEvent.TYPE_WINDOWS_CHANGED,
-            AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> requestSurfaceRefresh(FACEBOOK, 120L)
-            AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                val destination = facebookNavigationDestination(event.source)
-                if (destination != null && destination != "reels") {
-                    facebookNonVideoNavSuppressUntil = System.currentTimeMillis() + NON_VIDEO_NAV_SUPPRESS_MS
-                    forceLeaveShortSurface("FB", "navigation=$destination")
-                    refreshTargetSurfaceWithRetries(FACEBOOK)
-                } else if (destination == "reels") {
-                    facebookNonVideoNavSuppressUntil = 0L
-                }
-            }
-            AccessibilityEvent.TYPE_VIEW_SCROLLED -> handleFacebookPagerScroll(event)
-            AccessibilityEvent.TYPE_VIEW_SELECTED -> {
-                val destination = facebookNavigationDestination(event.source)
-                if (destination != null && destination != "reels") {
-                    facebookNonVideoNavSuppressUntil = System.currentTimeMillis() + NON_VIDEO_NAV_SUPPRESS_MS
-                    forceLeaveShortSurface("FB", "selected navigation=$destination")
-                    refreshTargetSurfaceWithRetries(FACEBOOK)
-                } else {
-                    if (destination == "reels") facebookNonVideoNavSuppressUntil = 0L
-                    handleFacebookPagerScroll(event)
-                }
-            }
-        }
-    }
 
     private fun refreshFacebookSurface() {
         if (currentTargetPackage != FACEBOOK) return
@@ -3644,53 +3345,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
         return ("TT|" + tokens.sorted().take(14).joinToString("|")).hashCode()
     }
 
-    private fun pollTikTokIdentity() {
-        if (currentMode != ScreenMode.TIKTOK_FEED || interventionShowing) return
-        val now = System.currentTimeMillis()
-        val fp = buildTikTokVideoFingerprint()
-        if (fp == 0) return
-
-        if (tiktokFingerprint.current == 0) {
-            tiktokFingerprint.current = fp
-            rememberFingerprint(tiktokFingerprint, fp)
-            tiktokPollCandidate = 0
-            tiktokPollCandidateSince = 0L
-            diag("TT POLL baseline=$fp")
-            return
-        }
-        if (fp == tiktokFingerprint.current) {
-            tiktokPollCandidate = 0
-            tiktokPollCandidateSince = 0L
-            return
-        }
-
-        if (tiktokPollCandidate != fp) {
-            tiktokPollCandidate = fp
-            tiktokPollCandidateSince = now
-            return
-        }
-        if (now - tiktokPollCandidateSince < TIKTOK_IDENTITY_STABLE_MS) return
-
-        val previous = tiktokFingerprint.current
-        val seenBefore = tiktokFingerprint.recent.contains(fp)
-        tiktokFingerprint.current = fp
-        rememberFingerprint(tiktokFingerprint, fp)
-        tiktokPollCandidate = 0
-        tiktokPollCandidateSince = 0L
-
-        if (seenBefore) {
-            diag("TT POLL returned-to-recent $previous->$fp no-count")
-            return
-        }
-        if (now - lastTikTokNavigationSignalAt < 750L) {
-            diag("TT POLL deduped against navigation")
-            return
-        }
-        acceptForwardTransition("TT", ScreenMode.TIKTOK_FEED, "stable-identity-poll")
-        lastTikTokNavigationSignalAt = now
-        updateBubble()
-    }
-
     private fun buildVisibleVideoFingerprint(platform: String): Int {
         val packageName = currentTargetPackage ?: return 0
         val roots = targetRootsFor(packageName)
@@ -3862,53 +3516,6 @@ class MindScrollAccessibilityService : AccessibilityService() {
         } else {
             diag("$platform BACKWARD $old->$cur no-count")
         }
-    }
-
-    private fun scheduleSettledPagerIndex(
-        platform: String,
-        pager: PagerState,
-        cur: Int,
-        directionHint: Int,
-        mode: ScreenMode
-    ) {
-        if (cur < 0) return
-        pager.settledIndexCandidate = cur
-        if (directionHint != 0) pager.settledIndexDirectionHint = directionHint
-        val token = ++pager.settledIndexToken
-
-        handler.postDelayed({
-            if (token != pager.settledIndexToken || interventionShowing ||
-                !pager.active || currentMode != mode) return@postDelayed
-
-            val finalIndex = pager.settledIndexCandidate
-            val finalDirection = pager.settledIndexDirectionHint
-            pager.settledIndexDirectionHint = 0
-            if (finalIndex < 0) return@postDelayed
-
-            if (pager.page < 0) {
-                pager.page = finalIndex
-                diag("$platform SETTLED baseline page=$finalIndex")
-                return@postDelayed
-            }
-            if (finalIndex == pager.page) {
-                diag("$platform SETTLED same page=$finalIndex; gesture snapped back")
-                return@postDelayed
-            }
-
-            val old = pager.page
-            pager.page = finalIndex
-            val forward = when {
-                finalDirection > 0 -> true
-                finalDirection < 0 -> false
-                else -> finalIndex > old
-            }
-            if (forward) {
-                acceptForwardTransition(platform, mode, "settled-page $old->$finalIndex")
-            } else {
-                diag("$platform SETTLED backward $old->$finalIndex no-count")
-            }
-            updateBubble()
-        }, 340L)
     }
 
     private fun collectPagerFallback(
